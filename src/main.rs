@@ -37,8 +37,47 @@ fn last_note() -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false)) // flat Fase 2: ignora subdirectorios
         .max() // YYYYMMDD-HHMMSS.md ordena lexicográficamente
+}
+
+// ---------- título derivado (Fase 2, spec #20, fn pura) ----------
+
+fn truncate_title(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
+}
+
+/// Primer heading (`# `, `## `…: strip `#` + trim) → si no hay, primera línea
+/// no vacía (trim, máx 60 + `…`) → si vacío, `"Untitled"`.
+/// Sin frontmatter en Fase 2: un `---` inicial cuenta como línea normal.
+fn derive_title(text: &str) -> String {
+    let mut fallback: Option<&str> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with('#') {
+            let h = t.trim_start_matches('#').trim();
+            if !h.is_empty() {
+                return h.to_string();
+            }
+            continue;
+        }
+        if fallback.is_none() {
+            fallback = Some(t);
+        }
+    }
+    match fallback {
+        Some(f) => truncate_title(f, 60),
+        None => "Untitled".into(),
+    }
 }
 
 // ---------- theme (Fase 1: mínimo, tolerante, re-lee por mtime) ----------
@@ -134,6 +173,8 @@ struct State {
     suppress: Cell<bool>,
     css: gtk4::CssProvider,
     theme_mtime: RefCell<Option<SystemTime>>,
+    last_synced: RefCell<Option<String>>, // buffer tal como quedó en disco (save/load)
+    dialog_open: Cell<bool>,              // un solo diálogo de conflicto a la vez
 }
 
 type Shared = Rc<State>;
@@ -142,6 +183,10 @@ fn buffer_text(s: &Shared) -> String {
     let buf = s.view.buffer();
     let (a, b) = (buf.start_iter(), buf.end_iter());
     buf.text(&a, &b, false).to_string()
+}
+
+fn refresh_title(s: &Shared) {
+    s.window.set_title(Some(&derive_title(&buffer_text(s))));
 }
 
 fn maybe_refresh_theme(s: &Shared) {
@@ -175,6 +220,8 @@ fn save_now(s: &Shared) {
     })();
     if let Err(e) = r {
         eprintln!("[emax-notes] save error {path:?}: {e}");
+    } else {
+        *s.last_synced.borrow_mut() = Some(text);
     }
 }
 
@@ -195,6 +242,7 @@ fn schedule_save(s: &Shared) {
     let id = glib::timeout_add_local_once(Duration::from_millis(400), move || {
         if let Some(st) = weak.upgrade() {
             save_now(&st);
+            refresh_title(&st); // título con el mismo debounce, barato
         }
     });
     *s.save_src.borrow_mut() = Some(id);
@@ -206,8 +254,10 @@ fn set_text_silent(s: &Shared, text: &str, path: Option<PathBuf>) {
         id.remove();
     }
     s.view.buffer().set_text(text);
-    *s.path.borrow_mut() = path;
+    *s.path.borrow_mut() = path.clone();
+    *s.last_synced.borrow_mut() = path.map(|_| text.to_string());
     s.suppress.set(false);
+    refresh_title(s);
 }
 
 fn flush_or_cancel(s: &Shared) {
@@ -223,6 +273,85 @@ fn flush_or_cancel(s: &Shared) {
         }
         save_now(s);
     }
+}
+
+// ---------- file watcher (Fase 2, spec #27-28) ----------
+
+/// Solo importa la nota ABIERTA. Filtro de self-events del autosave atómico:
+/// si el contenido en disco == `last_synced` (lo último que escribimos/leímos),
+/// el evento es nuestro (rename tempfile→persist) y se ignora. Sin ventanas
+/// de tiempo ni PIDs: comparación de contenido, robusta a debounce y races.
+fn on_watch_event(s: &Shared, paths: &[PathBuf]) {
+    let open = s.path.borrow().clone();
+    let Some(path) = open else { return }; // nota nueva sin archivo: creates externos → nada
+    if !paths.iter().any(|p| p == &path) {
+        return;
+    }
+    match std::fs::read_to_string(&path) {
+        Err(_) => {
+            // Delete externo de la abierta: se conserva el buffer;
+            // al guardar se recrea el archivo (mismo path).
+            eprintln!(
+                "[emax-notes] borrado externo, conservo buffer: {}",
+                path.display()
+            );
+        }
+        Ok(disk) => {
+            if Some(&disk) == s.last_synced.borrow().as_ref() {
+                return; // self-event o sin cambios reales
+            }
+            let pending = s.save_src.borrow().is_some()
+                || buffer_text(s) != s.last_synced.borrow().clone().unwrap_or_default();
+            if !pending {
+                // Sin edición local: reload silencioso (un solo paso de undo,
+                // historial previo intacto) + aviso mínimo a stderr.
+                set_text_silent(s, &disk, Some(path.clone()));
+                eprintln!("[emax-notes] reload externo silencioso: {}", path.display());
+            } else {
+                ask_conflict(s);
+            }
+        }
+    }
+}
+
+/// Conflicto (edición local pendiente + cambio externo): diálogo modal mínimo
+/// con 2 botones. Sin Compare en Fase 2.
+fn ask_conflict(s: &Shared) {
+    if s.dialog_open.get() {
+        return; // un solo diálogo; el reload lee disco fresco al confirmar
+    }
+    s.dialog_open.set(true);
+    let dlg = gtk4::AlertDialog::builder()
+        .message("La nota cambió en disco")
+        .detail("Tenés cambios sin guardar. ¿Recargar la versión externa o conservar la tuya?")
+        .buttons(["Reload external", "Keep mine"])
+        .build();
+    let st = s.clone();
+    dlg.choose(
+        Some(&s.window),
+        None::<&gtk4::gio::Cancellable>,
+        move |resp: Result<i32, glib::Error>| {
+            st.dialog_open.set(false);
+            if resp == Ok(0) {
+                // Reload external
+                if let Some(path) = st.path.borrow().clone() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(disk) => {
+                            set_text_silent(&st, &disk, Some(path));
+                            eprintln!("[emax-notes] conflicto: reload externo");
+                        }
+                        Err(_) => eprintln!(
+                            "[emax-notes] conflicto: el archivo ya no existe, conservo buffer"
+                        ),
+                    }
+                }
+            } else {
+                // Keep mine (resp == 1; Err o -1 = descartado → también conserva)
+                save_now(&st);
+                eprintln!("[emax-notes] conflicto: keep mine (guardado)");
+            }
+        },
+    );
 }
 
 fn show_new(s: &Shared) {
@@ -248,7 +377,7 @@ fn show_last(s: &Shared) {
 fn toggle(s: &Shared, want_last: bool) {
     if s.window.is_visible() {
         flush_or_cancel(s);
-        s.window.hide();
+        s.window.set_visible(false);
     } else if want_last {
         show_last(s);
     } else {
@@ -284,6 +413,40 @@ fn build_ui(app: &gtk4::Application) -> Shared {
     gtk4::style_context_add_provider_for_display(&WidgetExt::display(&window), &css, 800);
     apply_theme(&css, &load_theme());
 
+    // File watcher Fase 2: inotify sobre ~/Notes (debouncer 200 ms).
+    // El handler de notify corre en otro thread → canal futures (ya en el
+    // árbol vía glib, sin polling) consumido por un future en el main loop.
+    let (watch_tx, watch_rx) = futures_channel::mpsc::unbounded::<Vec<PathBuf>>();
+    let keep_watcher = match notify_debouncer_mini::new_debouncer(
+        Duration::from_millis(200),
+        move |res: notify_debouncer_mini::DebounceEventResult| match res {
+            Ok(evs) => {
+                let paths: Vec<PathBuf> = evs.into_iter().map(|e| e.path).collect();
+                let _ = watch_tx.unbounded_send(paths);
+            }
+            Err(e) => eprintln!("[emax-notes] watch error: {e:?}"),
+        },
+    ) {
+        Ok(mut d) => {
+            if let Err(e) = d
+                .watcher()
+                .watch(&notes_dir(), notify::RecursiveMode::Recursive)
+            {
+                eprintln!("[emax-notes] no se pudo vigilar ~/Notes: {e}");
+            }
+            Some(d)
+        }
+        Err(e) => {
+            eprintln!("[emax-notes] watcher no disponible: {e}");
+            None
+        }
+    };
+    // El watcher debe vivir lo que el proceso (app en fondo tras hide):
+    // se olvida a propósito, sin Drop. `ponytail: leak intencional de 1 watcher`.
+    if let Some(d) = keep_watcher {
+        std::mem::forget(d);
+    }
+
     let st = Rc::new(State {
         window,
         view,
@@ -292,7 +455,30 @@ fn build_ui(app: &gtk4::Application) -> Shared {
         suppress: Cell::new(false),
         css,
         theme_mtime: RefCell::new(colors_mtime()),
+        last_synced: RefCell::new(None),
+        dialog_open: Cell::new(false),
     });
+
+    // Eventos del watcher → solo importan para la nota abierta.
+    // Future en el main thread: puede tocar GTK/Rc sin Send.
+    {
+        let weak = Rc::downgrade(&st);
+        glib::spawn_future_local(async move {
+            use futures_core::Stream as _;
+            let mut rx = watch_rx;
+            loop {
+                let next =
+                    std::future::poll_fn(|cx| std::pin::Pin::new(&mut rx).poll_next(cx)).await;
+                let Some(paths) = next else { break }; // watcher caído: termina
+                if let Some(s) = weak.upgrade() {
+                    on_watch_event(&s, &paths);
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+    refresh_title(&st);
 
     // Autosave con debounce.
     {
@@ -307,7 +493,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
             use gtk4::gdk::{Key, ModifierType};
             if keyval == Key::Escape {
                 flush_or_cancel(&s);
-                s.window.hide();
+                s.window.set_visible(false);
                 return glib::Propagation::Stop;
             }
             if mods.contains(ModifierType::CONTROL_MASK) && (keyval == Key::n || keyval == Key::N) {
@@ -328,7 +514,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
         let s = st.clone();
         st.window.connect_close_request(move |_| {
             flush_or_cancel(&s);
-            s.window.hide();
+            s.window.set_visible(false);
             glib::Propagation::Stop
         });
     }
@@ -401,4 +587,68 @@ fn main() {
     }
 
     std::process::exit(app.run().into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_title;
+
+    #[test]
+    fn heading() {
+        assert_eq!(derive_title("# Hola\ncuerpo de la nota"), "Hola");
+    }
+
+    #[test]
+    fn sub_heading() {
+        assert_eq!(derive_title("intro\n## Subtítulo\nmás texto"), "Subtítulo");
+    }
+
+    #[test]
+    fn heading_con_espacios() {
+        assert_eq!(derive_title("#    Espaciado   \nx"), "Espaciado");
+    }
+
+    #[test]
+    fn linea_simple() {
+        assert_eq!(derive_title("comprar pan"), "comprar pan");
+    }
+
+    #[test]
+    fn multiline_con_blancos() {
+        assert_eq!(derive_title("\n  \n  primera  \nsegunda"), "primera");
+    }
+
+    #[test]
+    fn vacio() {
+        assert_eq!(derive_title(""), "Untitled");
+        assert_eq!(derive_title("  \n \n\t\n"), "Untitled");
+    }
+
+    #[test]
+    fn linea_larga_truncada() {
+        let larga = "x".repeat(70);
+        assert_eq!(derive_title(&larga), format!("{}…", "x".repeat(60)));
+    }
+
+    #[test]
+    fn exacta_60_no_trunca() {
+        let justa = "y".repeat(60);
+        assert_eq!(derive_title(&justa), justa);
+    }
+
+    #[test]
+    fn heading_gana_a_parrafo_previo() {
+        assert_eq!(
+            derive_title("párrafo primero\n# Título real"),
+            "Título real"
+        );
+    }
+
+    #[test]
+    fn sin_frontmatter_en_fase_2() {
+        // Literal: el `---` inicial cuenta como primera línea no vacía…
+        assert_eq!(derive_title("---\ntitle: x"), "---");
+        // …pero un heading posterior sigue teniendo prioridad.
+        assert_eq!(derive_title("---\ntitle: x\n---\n# Real"), "Real");
+    }
 }

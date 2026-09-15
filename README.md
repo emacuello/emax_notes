@@ -1,10 +1,12 @@
-# emax-notes — Fase 1
+# emax-notes — Fase 2
 
 Bloc de notas local-first, keyboard-first para Omarchy + Hyprland + Wayland.
 Fase 1: ventana única `sourceview5` + markdown, lazy + autosave atómico,
 tema Omarchy mínimo, single-instance con `toggle-new` / `toggle-last`.
 Ventana 560x780 vertical estilo libreta, flotante centrada, opaca,
 con `dim_around` (efecto spotlight: atenúa el resto).
+Fase 2: título derivado del contenido + file watcher inotify con diálogo
+de conflicto mínimo.
 
 ## Requisito del sistema
 
@@ -20,7 +22,9 @@ cargo build
 cargo run -- toggle-new
 ```
 
-`Cargo.lock` ya fija versiones (93 paquetes: `gtk4 0.11.4`, `sourceview5 0.11.2`, …).
+`Cargo.lock` fija versiones (117 paquetes: `gtk4 0.11.4`, `sourceview5 0.11.2`,
+`notify 8.2.0`, `notify-debouncer-mini 0.7.0`, …). `futures-channel`/`futures-core`
+0.3.34 ya venían en el árbol (transitivos de glib): cero crates nuevos por el canal.
 
 > Nota de versiones: el alcance pedía `gtk4 0.11 + sourceview5 0.10`,
 > pero ese par **no resuelve** (`sourceview5 0.10` depende de `gtk4-sys 0.10`
@@ -116,8 +120,38 @@ ps -o rss=,comm= -C emax-notes   # RSS en KiB en reposo tras Esc (oculta)
 Objetivo Fase 1: `window.present < 400 ms` en cold. RSS se reporta en KiB
 (`ps -o rss`) sin objetivo numérico fijado en esta fase.
 
-## Alcance explícito Fase 1 (qué NO hay)
+## Alcance explícito Fase 2 (qué NO hay)
 
-Sin palette Ctrl+K, sin FTS/search, sin watcher permanente (solo re-lectura de
-tema por mtime en cada `activate`), sin preview markdown, sin spellcheck,
-sin settings UI, sin packaging. Ver `bloc_de_notas.md` (spec completa, 1958 líneas).
+Sin palette Ctrl+K, sin FTS/search, sin preview markdown, sin spellcheck,
+sin settings UI, sin packaging. El watcher es solo para la nota abierta
+(creates externos los consume Fase 3) y el diálogo de conflicto no tiene
+Compare (diferido a Fase 3). Ver `bloc_de_notas.md` (spec completa).
+
+## Fase 2: título derivado + watcher
+
+Título de ventana derivado del contenido (`derive_title`, spec #20): primer
+heading Markdown (strip `#` + trim) → si no hay, primera línea no vacía
+(trim, máx 60 + `…`) → si vacío, `Untitled`. Sin frontmatter en Fase 2
+(`---` inicial cuenta como línea normal). Se actualiza con el mismo debounce
+de 400 ms del autosave, más inmediato al mostrar/cargar/recargar nota.
+Nota: la regla Hyprland primaria matchea por `class` (`^dev.emax.notes$`),
+así que el título dinámico no la rompe.
+
+Watcher (`notify 8` + `notify-debouncer-mini 0.7`, backend inotify, debounce
+200 ms) sobre `~/Notes` recursivo pero plano en Fase 2: subdirectorios se
+ignoran (`last_note` solo `is_file`, eventos solo del path abierto).
+Solo importa la nota abierta: cambio externo sin edición local pendiente
+→ reload silencioso (un solo paso de undo) + aviso a stderr; con edición
+local pendiente → `AlertDialog` modal con 2 botones, `Reload external` /
+`Keep mine` (descartar el diálogo conserva lo tuyo y guarda). Delete externo
+→ se conserva el buffer y al guardar se recrea el archivo. Creates externos
+→ nada.
+
+Probar manual (reload <500 ms):
+
+```bash
+cargo run -- toggle-last          # abre la nota más reciente
+nvim ~/Notes/<id>.md              # editar + :w fuera → la app recarga sola
+# Conflicto: escribir en la app (sin esperar 400 ms) + :w en nvim
+# → aparece el diálogo de 2 opciones
+```
