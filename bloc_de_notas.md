@@ -1,5 +1,5 @@
 Quiero que diseñes e implementes una aplicación de notas extremadamente rápida, simple, local-first y pensada específicamente para Omarchy + Hyprland + Wayland.
-
+-
 El objetivo NO es crear otro Obsidian, Notion, Joplin o QOwnNotes.
 
 La aplicación debe sentirse como una herramienta integrada al sistema y prácticamente desaparecer mientras no la necesito.
