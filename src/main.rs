@@ -176,6 +176,7 @@ struct State {
     last_synced: RefCell<Option<String>>, // buffer tal como quedó en disco (save/load)
     dialog_open: Cell<bool>,              // un solo diálogo de conflicto a la vez
     palette: RefCell<Option<PaletteUi>>,  // Some solo mientras la palette está abierta
+    index: RefCell<Option<rusqlite::Connection>>, // FTS5 (main thread); None → palette solo títulos
 }
 
 type Shared = Rc<State>;
@@ -222,8 +223,9 @@ fn save_now(s: &Shared) {
     if let Err(e) = r {
         eprintln!("[emax-notes] save error {path:?}: {e}");
     } else {
-        *s.last_synced.borrow_mut() = Some(text);
+        *s.last_synced.borrow_mut() = Some(text.clone());
         touch_recent(&path);
+        index_upsert_path(s, &path, &text);
     }
 }
 
@@ -433,6 +435,277 @@ fn remove_from_state(path: &PathBuf) {
     st.recent.retain(|p| p != path);
     st.favorites.retain(|p| p != path);
     save_state(&st);
+}
+
+// ---------- índice FTS5 (Fase 4): descartable en ~/.cache/emax-notes/search-index/ ----------
+// rusqlite bundled trae FTS5. V1: `unicode61 remove_diacritics 2`, SIN porter,
+// SIN trigram, SIN prefix=. Los .md son la fuente de verdad; borrar el cache
+// nunca pierde notas (rebuild por escaneo). Incremental: save_now + watcher.
+
+fn cache_index_path() -> PathBuf {
+    let base = directories::BaseDirs::new()
+        .map(|b| b.cache_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache")
+        });
+    base.join("emax-notes/search-index/index.db")
+}
+
+fn file_mtime_secs(p: &PathBuf) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn init_db(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS docs(
+           id INTEGER PRIMARY KEY,
+           path TEXT UNIQUE NOT NULL,
+           title TEXT NOT NULL,
+           content TEXT NOT NULL,
+           updated_at INTEGER NOT NULL);
+         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+           title, content, content='docs', content_rowid='id',
+           tokenize='unicode61 remove_diacritics 2');
+         CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+           INSERT INTO notes_fts(rowid, title, content)
+           VALUES (new.id, new.title, new.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+           INSERT INTO notes_fts(notes_fts, rowid, title, content)
+           VALUES ('delete', old.id, old.title, old.content);
+         END;
+         CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+           INSERT INTO notes_fts(notes_fts, rowid, title, content)
+           VALUES ('delete', old.id, old.title, old.content);
+           INSERT INTO notes_fts(rowid, title, content)
+           VALUES (new.id, new.title, new.content);
+         END;",
+    )
+}
+
+fn upsert_doc(
+    conn: &rusqlite::Connection,
+    path: &str,
+    title: &str,
+    content: &str,
+    updated: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO docs(path, title, content, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET
+           title = excluded.title, content = excluded.content,
+           updated_at = excluded.updated_at",
+        rusqlite::params![path, title, content, updated],
+    )
+    .map(|_| ())
+}
+
+fn delete_doc(conn: &rusqlite::Connection, path: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM docs WHERE path = ?", [path])
+        .map(|_| ())
+}
+
+/// Escaneo plano de ~/Notes (ignora subdirs, como Fase 2-3).
+fn scan_notes() -> Vec<(String, i64)> {
+    std::fs::read_dir(notes_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false))
+        .map(|p| {
+            let mt = file_mtime_secs(&p);
+            (p.to_string_lossy().to_string(), mt)
+        })
+        .collect()
+}
+
+/// Arranque: si la DB no existe se crea; si hay incongruencia con el disco
+/// (faltan/sobran docs o cambió un mtime), rebuild completo por escaneo.
+fn sync_from_disk(conn: &rusqlite::Connection) {
+    use std::collections::HashMap;
+    let files = scan_notes();
+    let db_rows: Option<HashMap<String, i64>> = conn
+        .prepare("SELECT path, updated_at FROM docs")
+        .ok()
+        .and_then(|mut q| {
+            q.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+        });
+    let same = db_rows.as_ref().is_some_and(|db| {
+        files.len() == db.len() && files.iter().all(|(p, m)| db.get(p) == Some(m))
+    });
+    if same {
+        return;
+    }
+    if conn.execute("DELETE FROM docs", []).is_err() {
+        return; // DB rota: la palette sigue con títulos; el próximo arranque reintenta
+    }
+    let mut n = 0;
+    for (p, m) in &files {
+        let txt = std::fs::read_to_string(p).unwrap_or_default();
+        if upsert_doc(conn, p, &derive_title(&txt), &txt, *m).is_ok() {
+            n += 1;
+        }
+    }
+    eprintln!("[emax-notes] índice FTS rebuild: {n} docs");
+}
+
+fn open_index() -> Option<rusqlite::Connection> {
+    let db = cache_index_path();
+    if let Some(parent) = db.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return None;
+        }
+    }
+    let conn = rusqlite::Connection::open(&db).ok()?;
+    init_db(&conn).ok()?;
+    sync_from_disk(&conn);
+    Some(conn)
+}
+
+/// `docker redis puerto` → `"docker"* AND "redis"* AND "puerto"*`
+/// (cada término con sufijo `*`, `"` escapada como `""`).
+/// Vacía → None (no toca FTS: recents). `>` no llega acá (cmd_query).
+fn build_match(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
+struct ContentHit {
+    path: PathBuf,
+    title_hl: String,
+    snippet: String,
+}
+
+fn search_content(
+    conn: &rusqlite::Connection,
+    m: &str,
+    favs_json: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<ContentHit>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.path,
+                highlight(notes_fts, 0, '<b>', '</b>'),
+                snippet(notes_fts, 1, '<b>', '</b>', '…', 30)
+         FROM notes_fts JOIN docs d ON d.id = notes_fts.rowid
+         WHERE notes_fts MATCH :q
+         ORDER BY bm25(notes_fts, 10.0, 5.0)
+                  - ((:now - d.updated_at) / 86400.0) * 0.05
+                  - CASE WHEN d.path IN (SELECT value FROM json_each(:favs))
+                         THEN 2.0 ELSE 0.0 END
+         LIMIT 8",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::named_params! { ":q": m, ":now": now, ":favs": favs_json },
+        |row| {
+            let p: String = row.get(0)?;
+            Ok(ContentHit {
+                path: PathBuf::from(p),
+                title_hl: row.get(1)?,
+                snippet: row.get(2)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+fn favs_json() -> String {
+    let mut out = String::from("[");
+    for (i, p) in load_state().favorites.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(
+            &p.to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
+        );
+        out.push('"');
+    }
+    out.push(']');
+    out
+}
+
+fn search_hits(s: &Shared, m: &str) -> Vec<ContentHit> {
+    let idx = s.index.borrow();
+    let Some(conn) = idx.as_ref() else {
+        return vec![];
+    };
+    search_content(conn, m, &favs_json(), now_secs()).unwrap_or_else(|e| {
+        eprintln!("[emax-notes] fts error: {e}");
+        vec![]
+    })
+}
+
+/// Upsert tras persist OK en save_now.
+fn index_upsert_path(s: &Shared, path: &PathBuf, text: &str) {
+    let mut idx = s.index.borrow_mut();
+    let Some(conn) = idx.as_mut() else { return };
+    let key = path.to_string_lossy().to_string();
+    if let Err(e) = upsert_doc(conn, &key, &derive_title(text), text, file_mtime_secs(path)) {
+        eprintln!("[emax-notes] index upsert error: {e}");
+    }
+}
+
+/// Upsert/delete incremental por evento del watcher (solo ese doc).
+fn index_paths(s: &Shared, paths: &[PathBuf]) {
+    let dir = notes_dir();
+    let mut idx = s.index.borrow_mut();
+    let Some(conn) = idx.as_mut() else { return };
+    for p in paths {
+        if p.parent() != Some(dir.as_path()) {
+            continue;
+        }
+        if p.extension().map(|x| x != "md").unwrap_or(true) {
+            continue;
+        }
+        let key = p.to_string_lossy().to_string();
+        match std::fs::read_to_string(p) {
+            Ok(txt) => {
+                let mt = file_mtime_secs(p);
+                if let Err(e) = upsert_doc(conn, &key, &derive_title(&txt), &txt, mt) {
+                    eprintln!("[emax-notes] index upsert error: {e}");
+                }
+            }
+            Err(_) => {
+                if let Err(e) = delete_doc(conn, &key) {
+                    eprintln!("[emax-notes] index delete error: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Snippet FTS (marcas `<b>`) → markup Pango seguro: escapa el texto
+/// y restaura solo nuestras marcas.
+fn fts_markup(s: &str) -> String {
+    glib::markup_escape_text(&s.replace("<b>", "\u{1}").replace("</b>", "\u{2}"))
+        .replace('\u{1}', "<b>")
+        .replace('\u{2}', "</b>")
 }
 
 // ---------- filtro puro de la palette (Fase 3, sin FTS) ----------
@@ -754,6 +1027,32 @@ fn pal_add_cmd(pal: &PaletteUi, cmd: Cmd) {
     });
 }
 
+fn pal_add_content(pal: &PaletteUi, hit: &ContentHit, favorites: &[PathBuf]) {
+    let mut title = fts_markup(&hit.title_hl);
+    if favorites.iter().any(|f| f == &hit.path) {
+        title.push_str(" ★");
+    }
+    let title_lbl = gtk4::Label::new(None);
+    title_lbl.set_markup(&title);
+    title_lbl.set_xalign(0.0);
+    title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let snip_lbl = gtk4::Label::new(None);
+    snip_lbl.set_markup(&fts_markup(&hit.snippet));
+    snip_lbl.set_xalign(0.0);
+    snip_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    snip_lbl.add_css_class("dim-label");
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vbox.append(&title_lbl);
+    vbox.append(&snip_lbl);
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&vbox));
+    pal.list.append(&row);
+    pal.rows.borrow_mut().push(PalRow {
+        row,
+        item: PalItem::Note(hit.path.clone()),
+    });
+}
+
 fn pal_title_of(snap: &[(PathBuf, String)], path: &PathBuf) -> String {
     snap.iter()
         .find(|(p, _)| p == path)
@@ -827,6 +1126,20 @@ fn refresh_palette(s: &Shared) {
                     pal_header(&pal.list, "Notes");
                     for (p, t, _) in &notes {
                         pal_add_note(pal, p, t, &favorites);
+                    }
+                }
+                // Debajo: matches de contenido FTS con snippet (dedupe títulos).
+                if let Some(m) = build_match(&text) {
+                    let shown: Vec<&PathBuf> = notes.iter().map(|(p, _, _)| p).collect();
+                    let fresh: Vec<ContentHit> = search_hits(s, &m)
+                        .into_iter()
+                        .filter(|h| !shown.contains(&&h.path))
+                        .collect();
+                    if !fresh.is_empty() {
+                        pal_header(&pal.list, "Content");
+                        for h in &fresh {
+                            pal_add_content(pal, h, &favorites);
+                        }
                     }
                 }
                 let q = text.trim().to_lowercase();
@@ -1072,7 +1385,14 @@ fn build_ui(app: &gtk4::Application) -> Shared {
         last_synced: RefCell::new(None),
         dialog_open: Cell::new(false),
         palette: RefCell::new(None),
+        index: RefCell::new(None),
     });
+
+    // Índice FTS: abre/crea + sync; si falla, la palette sigue con títulos.
+    match open_index() {
+        Some(conn) => *st.index.borrow_mut() = Some(conn),
+        None => eprintln!("[emax-notes] índice FTS no disponible; palette solo títulos"),
+    }
 
     // Eventos del watcher → solo importan para la nota abierta.
     // Future en el main thread: puede tocar GTK/Rc sin Send.
@@ -1086,6 +1406,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
                     std::future::poll_fn(|cx| std::pin::Pin::new(&mut rx).poll_next(cx)).await;
                 let Some(paths) = next else { break }; // watcher caído: termina
                 if let Some(s) = weak.upgrade() {
+                    index_paths(&s, &paths); // incremental FTS solo de esos docs
                     on_watch_event(&s, &paths);
                 } else {
                     break;
@@ -1349,5 +1670,142 @@ mod tests {
         assert!(!Cmd::NewNote.matches("fav"));
         assert!(Cmd::NewNote.matches(""));
         assert!(Cmd::DeleteCurrent.matches("trash"));
+    }
+
+    // ---------- Fase 4: builder + recall FTS ----------
+
+    use super::{build_match, delete_doc, init_db, search_content, upsert_doc, ContentHit};
+
+    fn mem_index(docs: &[(&str, &str, &str)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (path, title, content) in docs {
+            upsert_doc(&conn, path, title, content, 1_700_000_000).unwrap();
+        }
+        conn
+    }
+
+    fn search_paths(conn: &rusqlite::Connection, q: &str) -> Vec<String> {
+        let m = build_match(q).unwrap();
+        search_content(conn, &m, "[]", 1_700_000_100)
+            .unwrap()
+            .into_iter()
+            .map(|h: ContentHit| h.path.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn builder_multi_termino() {
+        assert_eq!(
+            build_match("docker redis puerto"),
+            Some("\"docker\"* AND \"redis\"* AND \"puerto\"*".into())
+        );
+    }
+
+    #[test]
+    fn builder_escape_comillas() {
+        assert_eq!(build_match("di\"ce"), Some("\"di\"\"ce\"*".into()));
+    }
+
+    #[test]
+    fn builder_vacio() {
+        assert_eq!(build_match(""), None);
+        assert_eq!(build_match("   "), None);
+    }
+
+    #[test]
+    fn builder_un_termino() {
+        assert_eq!(build_match("docker"), Some("\"docker\"*".into()));
+    }
+
+    #[test]
+    fn fts_diacritics() {
+        let conn = mem_index(&[(
+            "/n/recetas.md",
+            "Recetas",
+            "La configuración del horno a 180 grados.",
+        )]);
+        assert_eq!(search_paths(&conn, "configuracion"), ["/n/recetas.md"]);
+    }
+
+    #[test]
+    fn fts_prefix() {
+        let conn = mem_index(&[("/n/d.md", "Docker", "Contenedores y compose.")]);
+        assert_eq!(search_paths(&conn, "dock"), ["/n/d.md"]);
+    }
+
+    #[test]
+    fn fts_multi_termino_sin_substring_exacto() {
+        let conn = mem_index(&[(
+            "/n/infra.md",
+            "Infra",
+            "Redis está expuesto en el puerto 6379 del compose.",
+        )]);
+        // "redis 6379" no aparece contiguo, pero ambos términos sí.
+        assert_eq!(search_paths(&conn, "redis 6379"), ["/n/infra.md"]);
+        assert!(search_paths(&conn, "redis mongo").is_empty());
+    }
+
+    #[test]
+    fn fts_update_incremental() {
+        let conn = mem_index(&[("/n/a.md", "A", "texto original")]);
+        assert_eq!(search_paths(&conn, "original"), ["/n/a.md"]);
+        upsert_doc(&conn, "/n/a.md", "A", "texto editado", 1_700_000_200).unwrap();
+        assert!(search_paths(&conn, "original").is_empty());
+        assert_eq!(search_paths(&conn, "editado"), ["/n/a.md"]);
+    }
+
+    #[test]
+    fn fts_delete_purga() {
+        let conn = mem_index(&[("/n/a.md", "A", "texto borrable")]);
+        assert_eq!(search_paths(&conn, "borrable"), ["/n/a.md"]);
+        delete_doc(&conn, "/n/a.md").unwrap();
+        assert!(search_paths(&conn, "borrable").is_empty());
+    }
+
+    #[test]
+    fn fts_snippet_marca_match() {
+        let conn = mem_index(&[(
+            "/n/a.md",
+            "Título",
+            "El puerto 6379 expone redis en docker.",
+        )]);
+        let m = build_match("redis").unwrap();
+        let hits = search_content(&conn, &m, "[]", 1_700_000_100).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("<b>redis</b>"),
+            "{}",
+            hits[0].snippet
+        );
+    }
+
+    #[test]
+    fn fts_latencia_query_tipica() {
+        let mut docs: Vec<(String, String, String)> = vec![];
+        for i in 0..50 {
+            docs.push((
+                format!("/n/{i:03}.md"),
+                format!("Nota {i}"),
+                format!("Contenido de relleno número {i} con palabras comunes."),
+            ));
+        }
+        docs.push((
+            "/n/infra.md".into(),
+            "Infra".into(),
+            "Redis en puerto 6379 dentro del compose de docker.".into(),
+        ));
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (p, t, c) in &docs {
+            upsert_doc(&conn, p, t, c, 1_700_000_000).unwrap();
+        }
+        let m = build_match("redis docker").unwrap();
+        let t0 = std::time::Instant::now();
+        let hits = search_content(&conn, &m, "[]", 1_700_000_100).unwrap();
+        let dt = t0.elapsed();
+        eprintln!("[fts latency] 51 docs, query 'redis docker': {dt:?}");
+        assert_eq!(hits.len(), 1);
+        assert!(dt.as_millis() < 500, "query FTS lenta: {dt:?}");
     }
 }

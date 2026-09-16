@@ -1,4 +1,4 @@
-# emax-notes — Fase 3
+# emax-notes — Fase 4
 
 Bloc de notas local-first, keyboard-first para Omarchy + Hyprland + Wayland.
 Fase 1: ventana única `sourceview5` + markdown, lazy + autosave atómico,
@@ -8,6 +8,7 @@ con `dim_around` (efecto spotlight: atenúa el resto).
 Fase 2: título derivado del contenido + file watcher inotify con diálogo
 de conflicto mínimo.
 Fase 3: palette Ctrl+K + estado XDG (recents/favorites).
+Fase 4: búsqueda full-text FTS5 (títulos + contenido con snippets).
 
 ## Requisito del sistema
 
@@ -121,12 +122,45 @@ ps -o rss=,comm= -C emax-notes   # RSS en KiB en reposo tras Esc (oculta)
 Objetivo Fase 1: `window.present < 400 ms` en cold. RSS se reporta en KiB
 (`ps -o rss`) sin objetivo numérico fijado en esta fase.
 
-## Alcance explícito Fase 3 (qué NO hay)
+## Alcance explícito Fase 4 (qué NO hay)
 
-Sin FTS de contenido hasta Fase 4 (la palette solo filtra títulos),
-sin preview markdown (Fase 5), sin rename/move/settings (después),
-sin spellcheck, sin packaging. El diálogo de conflicto sigue sin Compare.
-Ver `bloc_de_notas.md` (spec completa).
+Sin preview markdown (Fase 5), sin rename/move/settings (después),
+sin spellcheck, sin packaging. El FTS es V1: sin fuzzy Levenshtein,
+sin trigram, sin Tantivy, sin porter, sin stemming — substring por token
+con `*`, `unicode61 remove_diacritics 2` (tolera `configuracion` →
+`configuración`). Ver `bloc_de_notas.md` (spec completa).
+
+## Fase 4: búsqueda full-text FTS5
+
+Índice en `~/.cache/emax-notes/search-index/index.db` (`rusqlite` bundled):
+tabla `docs` + `notes_fts USING fts5(title, content, …, tokenize='unicode61
+remove_diacritics 2')` + triggers INSERT/UPDATE/DELETE. **Descartable**:
+borrar la carpeta no pierde notas (rebuild por escaneo al arrancar si hay
+incongruencia). Incremental vía `save_now` + eventos del watcher.
+
+Sintaxis de query: `docker redis puerto` → `"docker"* AND "redis"* AND
+"puerto"*` (AND por whitespace, `"` escapada). Vacía → recents (sin FTS);
+`>foo` → solo comandos. Ranking: `bm25(…, 10.0, 5.0)` (título x2) −
+recency lineal − favorito ×2.0 (joineado por path con el state XDG).
+La palette muestra títulos primero (lógica intacta) y debajo contenido con
+snippet (`<b>` + `…`, 30 tokens) a markup Pango seguro.
+
+Latencia medida (`cargo test fts_latencia -- --nocapture`, 51 docs):
+
+```text
+[fts latency] 51 docs, query 'redis docker': 361.994µs
+```
+
+Sub-ms a esta escala: sin debounce en search-as-you-type (si alguna vez
+mide >50 ms, se mete debounce entonces, no antes).
+
+Probar manual:
+
+```bash
+cargo run -- toggle-new        # Ctrl+K + palabra que solo está en el cuerpo
+# → la nota aparece bajo "Content" con 1 línea de contexto
+# `configuracion` encuentra `configuración`
+```
 
 ## Fase 3: palette Ctrl+K + estado XDG
 
