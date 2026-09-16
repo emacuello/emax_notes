@@ -1,4 +1,4 @@
-# emax-notes — Fase 2
+# emax-notes — Fase 3
 
 Bloc de notas local-first, keyboard-first para Omarchy + Hyprland + Wayland.
 Fase 1: ventana única `sourceview5` + markdown, lazy + autosave atómico,
@@ -7,6 +7,7 @@ Ventana 560x780 vertical estilo libreta, flotante centrada, opaca,
 con `dim_around` (efecto spotlight: atenúa el resto).
 Fase 2: título derivado del contenido + file watcher inotify con diálogo
 de conflicto mínimo.
+Fase 3: palette Ctrl+K + estado XDG (recents/favorites).
 
 ## Requisito del sistema
 
@@ -120,12 +121,35 @@ ps -o rss=,comm= -C emax-notes   # RSS en KiB en reposo tras Esc (oculta)
 Objetivo Fase 1: `window.present < 400 ms` en cold. RSS se reporta en KiB
 (`ps -o rss`) sin objetivo numérico fijado en esta fase.
 
-## Alcance explícito Fase 2 (qué NO hay)
+## Alcance explícito Fase 3 (qué NO hay)
 
-Sin palette Ctrl+K, sin FTS/search, sin preview markdown, sin spellcheck,
-sin settings UI, sin packaging. El watcher es solo para la nota abierta
-(creates externos los consume Fase 3) y el diálogo de conflicto no tiene
-Compare (diferido a Fase 3). Ver `bloc_de_notas.md` (spec completa).
+Sin FTS de contenido hasta Fase 4 (la palette solo filtra títulos),
+sin preview markdown (Fase 5), sin rename/move/settings (después),
+sin spellcheck, sin packaging. El diálogo de conflicto sigue sin Compare.
+Ver `bloc_de_notas.md` (spec completa).
+
+## Fase 3: palette Ctrl+K + estado XDG
+
+Overlay temporal centrado (ventana modal hija, se destruye al cerrar):
+`SearchEntry` arriba + `ListBox` abajo. Vacía = Recent (máx 8) + Commands;
+con texto filtra títulos (`derive_title`, substring case-insensitive) +
+comandos que matcheen; `>foo` solo comandos. Search-as-you-type, Enter abre
+en la misma ventana, Esc/Ctrl+K cierra sin ocultar la app. Up/Down navega.
+Comandos (lista cerrada): New note, Toggle favorite (★ en la lista),
+Show favorites, Show recent, Delete current note (confirma con AlertDialog;
+borra del disco + buffer vacío). Rename/Move/Settings/Preview: pendientes.
+
+Estado en `~/.local/state/emax-notes/state.toml` (`recent` máx 20 al
+abrir/mostrar/guardar, `favorites`): purga paths inexistentes al cargar.
+`toggle-last` usa `recent[0]` con fallback a max filename.
+
+Probar manual:
+
+```bash
+cargo run -- toggle-new        # Ctrl+K → vacía muestra recents
+# escribir 3 letras → filtra al instante; Enter cambia de nota
+# `>fav` → solo comandos; Esc cierra palette sin ocultar app
+```
 
 ## Fase 2: título derivado + watcher
 

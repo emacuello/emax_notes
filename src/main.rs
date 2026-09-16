@@ -175,6 +175,7 @@ struct State {
     theme_mtime: RefCell<Option<SystemTime>>,
     last_synced: RefCell<Option<String>>, // buffer tal como quedó en disco (save/load)
     dialog_open: Cell<bool>,              // un solo diálogo de conflicto a la vez
+    palette: RefCell<Option<PaletteUi>>,  // Some solo mientras la palette está abierta
 }
 
 type Shared = Rc<State>;
@@ -222,6 +223,7 @@ fn save_now(s: &Shared) {
         eprintln!("[emax-notes] save error {path:?}: {e}");
     } else {
         *s.last_synced.borrow_mut() = Some(text);
+        touch_recent(&path);
     }
 }
 
@@ -254,6 +256,9 @@ fn set_text_silent(s: &Shared, text: &str, path: Option<PathBuf>) {
         id.remove();
     }
     s.view.buffer().set_text(text);
+    if let Some(p) = &path {
+        touch_recent(p); // abrir/mostrar nota → recent[0]
+    }
     *s.path.borrow_mut() = path.clone();
     *s.last_synced.borrow_mut() = path.map(|_| text.to_string());
     s.suppress.set(false);
@@ -354,6 +359,608 @@ fn ask_conflict(s: &Shared) {
     );
 }
 
+// ---------- estado XDG (Fase 3): ~/.local/state/emax-notes/state.toml ----------
+// Los .md no se tocan: recents/favoritos viven acá, cero ruido git.
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct NotesState {
+    recent: Vec<PathBuf>,    // más reciente primero, máx 20
+    favorites: Vec<PathBuf>, // sin orden garantizado
+}
+
+fn state_path() -> PathBuf {
+    let base = directories::BaseDirs::new()
+        .and_then(|b| b.state_dir().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+                .join(".local/state")
+        });
+    base.join("emax-notes/state.toml")
+}
+
+fn load_state() -> NotesState {
+    let mut st: NotesState = std::fs::read_to_string(state_path())
+        .ok()
+        .and_then(|txt| toml::from_str(&txt).ok())
+        .unwrap_or_default();
+    st.recent.retain(|p| p.is_file()); // purga lo que ya no existe
+    st.favorites.retain(|p| p.is_file());
+    st.recent.truncate(20);
+    st
+}
+
+fn save_state(st: &NotesState) {
+    let path = state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match toml::to_string(st) {
+        Ok(txt) => {
+            if let Err(e) = std::fs::write(&path, txt) {
+                eprintln!("[emax-notes] state write error: {e}");
+            }
+        }
+        Err(e) => eprintln!("[emax-notes] state serialize error: {e}"),
+    }
+}
+
+fn touch_recent(path: &PathBuf) {
+    let mut st = load_state();
+    if st.recent.first() == Some(path) {
+        return; // ya es recent[0]: sin IO extra
+    }
+    st.recent.retain(|p| p != path);
+    st.recent.insert(0, path.clone());
+    st.recent.truncate(20);
+    save_state(&st);
+}
+
+fn toggle_favorite(path: &PathBuf) -> bool {
+    let mut st = load_state();
+    let fav = if st.favorites.iter().any(|p| p == path) {
+        st.favorites.retain(|p| p != path);
+        false
+    } else {
+        st.favorites.push(path.clone());
+        true
+    };
+    save_state(&st);
+    fav
+}
+
+fn remove_from_state(path: &PathBuf) {
+    let mut st = load_state();
+    st.recent.retain(|p| p != path);
+    st.favorites.retain(|p| p != path);
+    save_state(&st);
+}
+
+// ---------- filtro puro de la palette (Fase 3, sin FTS) ----------
+
+fn recent_rank(idx: &Option<usize>) -> usize {
+    idx.unwrap_or(usize::MAX)
+}
+
+/// Substring case-insensitive sobre títulos (sin contenido: eso es Fase 4).
+/// Orden: prefix-match > substring; en cada grupo, más reciente primero;
+/// desempate por título. Vacía → recents primero. Con `>` → vacío
+/// (a nivel palette eso deja solo comandos).
+fn filter_notes(
+    query: &str,
+    notes: &[(PathBuf, String, Option<usize>)],
+) -> Vec<(PathBuf, String, Option<usize>)> {
+    let q = query.trim().to_lowercase();
+    if q.starts_with('>') {
+        return vec![];
+    }
+    if q.is_empty() {
+        let mut v = notes.to_vec();
+        v.sort_by(|a, b| {
+            recent_rank(&a.2)
+                .cmp(&recent_rank(&b.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        return v;
+    }
+    let mut hit: Vec<(u8, usize, &(PathBuf, String, Option<usize>))> = notes
+        .iter()
+        .filter_map(|n| {
+            let t = n.1.to_lowercase();
+            if t.starts_with(&q) {
+                Some((0, recent_rank(&n.2), n))
+            } else if t.contains(&q) {
+                Some((1, recent_rank(&n.2), n))
+            } else {
+                None
+            }
+        })
+        .collect();
+    hit.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2 .1.cmp(&b.2 .1))
+    });
+    hit.into_iter().map(|(_, _, n)| n.clone()).collect()
+}
+
+// ---------- comandos (lista cerrada Fase 3) ----------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cmd {
+    NewNote,
+    ToggleFavorite,
+    ShowFavorites,
+    ShowRecent,
+    DeleteCurrent,
+}
+
+impl Cmd {
+    const ALL: [Cmd; 5] = [
+        Cmd::NewNote,
+        Cmd::ToggleFavorite,
+        Cmd::ShowFavorites,
+        Cmd::ShowRecent,
+        Cmd::DeleteCurrent,
+    ];
+    fn name(self) -> &'static str {
+        match self {
+            Cmd::NewNote => "New note",
+            Cmd::ToggleFavorite => "Toggle favorite",
+            Cmd::ShowFavorites => "Show favorites",
+            Cmd::ShowRecent => "Show recent",
+            Cmd::DeleteCurrent => "Delete current note",
+        }
+    }
+    fn keywords(self) -> &'static str {
+        match self {
+            Cmd::NewNote => "new create",
+            Cmd::ToggleFavorite => "fav favorite star",
+            Cmd::ShowFavorites => "fav favorites list",
+            Cmd::ShowRecent => "recent history",
+            Cmd::DeleteCurrent => "delete remove trash",
+        }
+    }
+    fn matches(self, q: &str) -> bool {
+        q.is_empty() || self.name().to_lowercase().contains(q) || self.keywords().contains(q)
+    }
+}
+
+/// `>foo` → comandos con `foo`; sin `>` → None (notas + comandos).
+fn cmd_query(text: &str) -> Option<String> {
+    text.strip_prefix('>')
+        .map(|rest| rest.trim().to_lowercase())
+}
+
+// ---------- palette Ctrl+K (overlay temporal, sin estado permanente) ----------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PalMode {
+    Normal,
+    Favorites,
+    Recent,
+}
+
+#[derive(Clone)]
+enum PalItem {
+    Note(PathBuf),
+    Cmd(Cmd),
+}
+
+struct PalRow {
+    row: gtk4::ListBoxRow,
+    item: PalItem,
+}
+
+struct PaletteUi {
+    win: gtk4::Window,
+    entry: gtk4::SearchEntry,
+    list: gtk4::ListBox,
+    rows: RefCell<Vec<PalRow>>,
+    selected: Cell<usize>,
+    mode: Cell<PalMode>,
+    snapshot: Vec<(PathBuf, String)>, // títulos al abrir (search-as-you-type en memoria)
+    recents: Vec<PathBuf>,
+    favorites: RefCell<Vec<PathBuf>>,
+}
+
+fn snapshot_notes() -> Vec<(PathBuf, String)> {
+    let mut v: Vec<(PathBuf, String)> = std::fs::read_dir(notes_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false))
+        .map(|p| {
+            let t = std::fs::read_to_string(&p)
+                .map(|txt| derive_title(&txt))
+                .unwrap_or_else(|_| "Untitled".into());
+            (p, t)
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0)); // determinista; el orden final lo pone filter_notes
+    v
+}
+
+fn toggle_palette(s: &Shared) {
+    if s.palette.borrow().is_some() {
+        close_palette(s);
+    } else {
+        open_palette(s);
+    }
+}
+
+fn close_palette(s: &Shared) {
+    if let Some(pal) = s.palette.borrow_mut().take() {
+        pal.win.close();
+    }
+    s.view.grab_focus();
+}
+
+fn open_palette(s: &Shared) {
+    if s.palette.borrow().is_some() {
+        return;
+    }
+    let st = load_state();
+    let win = gtk4::Window::builder()
+        .transient_for(&s.window)
+        .modal(true)
+        .title("palette")
+        .default_width(480)
+        .resizable(false)
+        .build();
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+    let entry = gtk4::SearchEntry::new();
+    entry.set_placeholder_text(Some("Type to filter · `>` commands"));
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_min_content_height(320);
+    let list = gtk4::ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::Single);
+    scroll.set_child(Some(&list));
+    vbox.append(&entry);
+    vbox.append(&scroll);
+    win.set_child(Some(&vbox));
+
+    *s.palette.borrow_mut() = Some(PaletteUi {
+        win: win.clone(),
+        entry: entry.clone(),
+        list: list.clone(),
+        rows: RefCell::new(vec![]),
+        selected: Cell::new(0),
+        mode: Cell::new(PalMode::Normal),
+        snapshot: snapshot_notes(),
+        recents: st.recent,
+        favorites: RefCell::new(st.favorites),
+    });
+
+    // Search-as-you-type: filtra en cada keystroke, sin Enter.
+    {
+        let w = Rc::downgrade(s);
+        entry.connect_changed(move |_| {
+            if let Some(st) = w.upgrade() {
+                refresh_palette(&st);
+            }
+        });
+    }
+    // Enter abre lo seleccionado.
+    {
+        let w = Rc::downgrade(s);
+        entry.connect_activate(move |_| {
+            if let Some(st) = w.upgrade() {
+                let i = st
+                    .palette
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.selected.get())
+                    .unwrap_or(0);
+                pal_activate(&st, i);
+            }
+        });
+    }
+    // Click abre. Esc/Ctrl+K cierra (stack: sin palette, Esc oculta la app).
+    {
+        let w = Rc::downgrade(s);
+        list.connect_row_activated(move |_, row| {
+            if let Some(st) = w.upgrade() {
+                let idx = st
+                    .palette
+                    .borrow()
+                    .as_ref()
+                    .and_then(|pal| pal.rows.borrow().iter().position(|r| &r.row == row));
+                if let Some(i) = idx {
+                    pal_activate(&st, i);
+                }
+            }
+        });
+    }
+    // Un solo controller en la ventana (Capture): vale con foco en entry o lista.
+    {
+        let key = gtk4::EventControllerKey::new();
+        key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let w = Rc::downgrade(s);
+        key.connect_key_pressed(move |_, keyval, _, mods| {
+            use gtk4::gdk::{Key, ModifierType};
+            let Some(st) = w.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if keyval == Key::Escape
+                || (mods.contains(ModifierType::CONTROL_MASK)
+                    && (keyval == Key::k || keyval == Key::K))
+            {
+                close_palette(&st);
+                return glib::Propagation::Stop;
+            }
+            if keyval == Key::Up {
+                pal_move(&st, -1);
+                return glib::Propagation::Stop;
+            }
+            if keyval == Key::Down {
+                pal_move(&st, 1);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        win.add_controller(key);
+    }
+
+    refresh_palette(s);
+    win.present();
+    entry.grab_focus();
+}
+
+fn pal_header(list: &gtk4::ListBox, text: &str) {
+    let lbl = gtk4::Label::new(Some(text));
+    lbl.set_xalign(0.0);
+    lbl.add_css_class("dim-label");
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&lbl));
+    row.set_selectable(false);
+    row.set_activatable(false);
+    list.append(&row);
+}
+
+fn pal_add_note(pal: &PaletteUi, path: &PathBuf, title: &str, favorites: &[PathBuf]) {
+    let label = if favorites.iter().any(|f| f == path) {
+        format!("{title} ★")
+    } else {
+        title.to_string()
+    };
+    let lbl = gtk4::Label::new(Some(&label));
+    lbl.set_xalign(0.0);
+    lbl.set_hexpand(true);
+    lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&lbl));
+    pal.list.append(&row);
+    pal.rows.borrow_mut().push(PalRow {
+        row,
+        item: PalItem::Note(path.clone()),
+    });
+}
+
+fn pal_add_cmd(pal: &PaletteUi, cmd: Cmd) {
+    let lbl = gtk4::Label::new(Some(cmd.name()));
+    lbl.set_xalign(0.0);
+    lbl.add_css_class("dim-label");
+    let row = gtk4::ListBoxRow::new();
+    row.set_child(Some(&lbl));
+    pal.list.append(&row);
+    pal.rows.borrow_mut().push(PalRow {
+        row,
+        item: PalItem::Cmd(cmd),
+    });
+}
+
+fn pal_title_of(snap: &[(PathBuf, String)], path: &PathBuf) -> String {
+    snap.iter()
+        .find(|(p, _)| p == path)
+        .map(|(_, t)| t.clone())
+        .unwrap_or_else(|| "Untitled".into())
+}
+
+fn refresh_palette(s: &Shared) {
+    let pal_ref = s.palette.borrow();
+    let Some(pal) = pal_ref.as_ref() else { return };
+    let text = pal.entry.text().to_string();
+    let mode = pal.mode.get();
+    let snap = pal.snapshot.clone();
+    let recents = pal.recents.clone();
+    let favorites = pal.favorites.borrow().clone();
+
+    while let Some(ch) = pal.list.first_child() {
+        pal.list.remove(&ch);
+    }
+    pal.rows.borrow_mut().clear();
+
+    let rank = |p: &PathBuf| recents.iter().position(|r| r == p);
+    let with_rank: Vec<(PathBuf, String, Option<usize>)> = snap
+        .iter()
+        .map(|(p, t)| (p.clone(), t.clone(), rank(p)))
+        .collect();
+
+    match mode {
+        PalMode::Favorites => {
+            pal_header(&pal.list, "Favorites");
+            let mut n = 0;
+            for f in &favorites {
+                if f.is_file() {
+                    pal_add_note(pal, f, &pal_title_of(&snap, f), &favorites);
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                pal_header(&pal.list, "No favorites yet — use `Toggle favorite`");
+            }
+        }
+        PalMode::Recent => {
+            pal_header(&pal.list, "Recent");
+            for r in &recents {
+                if r.is_file() {
+                    pal_add_note(pal, r, &pal_title_of(&snap, r), &favorites);
+                }
+            }
+        }
+        PalMode::Normal => {
+            if let Some(cq) = cmd_query(&text) {
+                // `>foo`: solo comandos.
+                pal_header(&pal.list, "Commands");
+                for c in Cmd::ALL {
+                    if c.matches(&cq) {
+                        pal_add_cmd(pal, c);
+                    }
+                }
+            } else if text.trim().is_empty() {
+                pal_header(&pal.list, "Recent");
+                for (p, t, _) in with_rank.iter().filter(|n| n.2.is_some()).take(8) {
+                    pal_add_note(pal, p, t, &favorites);
+                }
+                pal_header(&pal.list, "Commands");
+                for c in Cmd::ALL {
+                    pal_add_cmd(pal, c);
+                }
+            } else {
+                let notes = filter_notes(&text, &with_rank);
+                if !notes.is_empty() {
+                    pal_header(&pal.list, "Notes");
+                    for (p, t, _) in &notes {
+                        pal_add_note(pal, p, t, &favorites);
+                    }
+                }
+                let q = text.trim().to_lowercase();
+                let cmds: Vec<Cmd> = Cmd::ALL.into_iter().filter(|c| c.matches(&q)).collect();
+                if !cmds.is_empty() {
+                    pal_header(&pal.list, "Commands");
+                    for c in cmds {
+                        pal_add_cmd(pal, c);
+                    }
+                }
+            }
+        }
+    }
+
+    pal.selected.set(0);
+    let rows = pal.rows.borrow();
+    if let Some(first) = rows.first() {
+        pal.list.select_row(Some(&first.row));
+    }
+}
+
+fn pal_move(s: &Shared, delta: isize) {
+    let pal_ref = s.palette.borrow();
+    let Some(pal) = pal_ref.as_ref() else { return };
+    let rows = pal.rows.borrow();
+    if rows.is_empty() {
+        return;
+    }
+    let next = (pal.selected.get() as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+    pal.selected.set(next);
+    pal.list.select_row(Some(&rows[next].row));
+}
+
+fn pal_activate(s: &Shared, idx: usize) {
+    let item = s
+        .palette
+        .borrow()
+        .as_ref()
+        .and_then(|pal| pal.rows.borrow().get(idx).map(|r| r.item.clone()));
+    match item {
+        Some(PalItem::Note(p)) => open_note_path(s, &p),
+        Some(PalItem::Cmd(c)) => run_command(s, c),
+        None => {}
+    }
+}
+
+fn open_note_path(s: &Shared, path: &PathBuf) {
+    close_palette(s);
+    match std::fs::read_to_string(path) {
+        Ok(txt) => set_text_silent(s, &txt, Some(path.clone())), // touch_recent adentro
+        Err(e) => {
+            eprintln!("[emax-notes] no se pudo abrir {}: {e}", path.display());
+            remove_from_state(path);
+            set_text_silent(s, "", None);
+        }
+    }
+    s.window.present();
+    s.view.grab_focus();
+}
+
+fn run_command(s: &Shared, cmd: Cmd) {
+    match cmd {
+        Cmd::NewNote => {
+            close_palette(s);
+            flush_or_cancel(s);
+            if !buffer_text(s).is_empty() {
+                save_now(s);
+            }
+            set_text_silent(s, "", None);
+            s.window.present();
+            s.view.grab_focus();
+        }
+        Cmd::ToggleFavorite => {
+            if let Some(p) = s.path.borrow().clone() {
+                let fav = toggle_favorite(&p);
+                eprintln!(
+                    "[emax-notes] {} favorito: {}",
+                    if fav { "★" } else { "☆" },
+                    p.display()
+                );
+                if let Some(pal) = s.palette.borrow().as_ref() {
+                    *pal.favorites.borrow_mut() = load_state().favorites;
+                }
+                refresh_palette(s); // actualiza ★ sin cerrar
+            }
+        }
+        Cmd::ShowFavorites | Cmd::ShowRecent => {
+            let mode = if cmd == Cmd::ShowFavorites {
+                PalMode::Favorites
+            } else {
+                PalMode::Recent
+            };
+            if let Some(pal) = s.palette.borrow().as_ref() {
+                pal.mode.set(mode);
+                pal.entry.set_text(""); // dispara changed → refresh
+            }
+        }
+        Cmd::DeleteCurrent => {
+            let Some(p) = s.path.borrow().clone() else {
+                return;
+            };
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.display().to_string());
+            let dlg = gtk4::AlertDialog::builder()
+                .message("Delete this note?")
+                .detail(&format!("{name} se borra del disco."))
+                .buttons(["Delete", "Cancel"])
+                .build();
+            let parent = s.palette.borrow().as_ref().map(|pal| pal.win.clone());
+            let st = s.clone();
+            dlg.choose(
+                parent.as_ref(),
+                None::<&gtk4::gio::Cancellable>,
+                move |resp: Result<i32, glib::Error>| {
+                    if resp == Ok(0) {
+                        if let Err(e) = std::fs::remove_file(&p) {
+                            eprintln!("[emax-notes] delete error {}: {e}", p.display());
+                        } else {
+                            eprintln!("[emax-notes] borrada: {}", p.display());
+                        }
+                        remove_from_state(&p);
+                        close_palette(&st);
+                        set_text_silent(&st, "", None);
+                        st.window.present();
+                        st.view.grab_focus();
+                    }
+                },
+            );
+        }
+    }
+}
+
 fn show_new(s: &Shared) {
     maybe_refresh_theme(s);
     set_text_silent(s, "", None);
@@ -363,7 +970,14 @@ fn show_new(s: &Shared) {
 
 fn show_last(s: &Shared) {
     maybe_refresh_theme(s);
-    match last_note() {
+    // recent[0] si existe (purga en load), fallback a max filename.
+    let target = load_state()
+        .recent
+        .into_iter()
+        .next()
+        .filter(|p| p.is_file())
+        .or_else(last_note);
+    match target {
         Some(p) => {
             let txt = std::fs::read_to_string(&p).unwrap_or_default();
             set_text_silent(s, &txt, Some(p));
@@ -457,6 +1071,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
         theme_mtime: RefCell::new(colors_mtime()),
         last_synced: RefCell::new(None),
         dialog_open: Cell::new(false),
+        palette: RefCell::new(None),
     });
 
     // Eventos del watcher → solo importan para la nota abierta.
@@ -503,6 +1118,10 @@ fn build_ui(app: &gtk4::Application) -> Shared {
                 }
                 set_text_silent(&s, "", None);
                 s.view.grab_focus();
+                return glib::Propagation::Stop;
+            }
+            if mods.contains(ModifierType::CONTROL_MASK) && (keyval == Key::k || keyval == Key::K) {
+                toggle_palette(&s); // abierta → la cierra
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -650,5 +1269,85 @@ mod tests {
         assert_eq!(derive_title("---\ntitle: x"), "---");
         // …pero un heading posterior sigue teniendo prioridad.
         assert_eq!(derive_title("---\ntitle: x\n---\n# Real"), "Real");
+    }
+
+    // ---------- Fase 3: filter_notes ----------
+
+    use super::{cmd_query, filter_notes, Cmd};
+    use std::path::PathBuf;
+
+    fn n(name: &str, title: &str, recent: Option<usize>) -> (PathBuf, String, Option<usize>) {
+        (PathBuf::from(name), title.to_string(), recent)
+    }
+
+    fn titles(v: &[(PathBuf, String, Option<usize>)]) -> Vec<&str> {
+        v.iter().map(|(_, t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn vacia_da_recents() {
+        let notes = vec![
+            n("b.md", "Bravo", Some(1)),
+            n("a.md", "Alpha", Some(0)),
+            n("c.md", "Charlie", None),
+        ];
+        assert_eq!(
+            titles(&filter_notes("", &notes)),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+    }
+
+    #[test]
+    fn prefix_gana_a_recency() {
+        let notes = vec![
+            n("old.md", "my docker notes", Some(0)),
+            n("new.md", "docker setup", Some(5)),
+        ];
+        assert_eq!(
+            titles(&filter_notes("doc", &notes)),
+            ["docker setup", "my docker notes"]
+        );
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let notes = vec![n("d.md", "Docker Compose", Some(0))];
+        assert_eq!(titles(&filter_notes("DOCKER", &notes)).len(), 1);
+        assert_eq!(titles(&filter_notes(" compose ", &notes)).len(), 1);
+    }
+
+    #[test]
+    fn mayor_solo_comandos() {
+        let notes = vec![n("f.md", "fav things", Some(0))];
+        assert!(filter_notes(">fav", &notes).is_empty());
+        assert_eq!(cmd_query(">fav"), Some("fav".into()));
+        assert_eq!(cmd_query("fav"), None);
+    }
+
+    #[test]
+    fn sin_match() {
+        let notes = vec![n("a.md", "Alpha", Some(0))];
+        assert!(filter_notes("zzz", &notes).is_empty());
+    }
+
+    #[test]
+    fn desempate_por_recency_en_substring() {
+        let notes = vec![
+            n("old.md", "notas de docker viejas", Some(3)),
+            n("new.md", "más docker acá", Some(0)),
+        ];
+        assert_eq!(
+            titles(&filter_notes("docker", &notes)),
+            ["más docker acá", "notas de docker viejas"]
+        );
+    }
+
+    #[test]
+    fn comandos_matchean() {
+        assert!(Cmd::ToggleFavorite.matches("fav"));
+        assert!(Cmd::ShowFavorites.matches("fav"));
+        assert!(!Cmd::NewNote.matches("fav"));
+        assert!(Cmd::NewNote.matches(""));
+        assert!(Cmd::DeleteCurrent.matches("trash"));
     }
 }
