@@ -88,6 +88,7 @@ struct Theme {
     foreground: String,
     accent: String,
     selection: String,
+    muted: String,
     font_size: i64,
 }
 
@@ -98,6 +99,7 @@ impl Default for Theme {
             foreground: "#FFFFFF".into(),
             accent: "#888888".into(),
             selection: "#343D41".into(),
+            muted: "#4B4E55".into(),
             font_size: 12,
         }
     }
@@ -136,6 +138,9 @@ fn load_theme() -> Theme {
             if let Some(s) = get("selection").or_else(|| get("selection_background")) {
                 t.selection = s;
             }
+            if let Some(s) = get("muted") {
+                t.muted = s;
+            }
         }
     }
     if let Ok(txt) = std::fs::read_to_string(&shell_path) {
@@ -154,13 +159,53 @@ fn load_theme() -> Theme {
     t
 }
 
-fn apply_theme(provider: &gtk4::CssProvider, t: &Theme) {
-    let css = format!(
+fn theme_css(t: &Theme) -> String {
+    format!(
         "window, textview, textview text {{ background-color: {}; color: {}; caret-color: {}; font-size: {}pt; }}\n\
-         textview selection {{ background-color: {}; color: {}; }}\n",
-        t.background, t.foreground, t.accent, t.font_size, t.selection, t.foreground,
-    );
-    provider.load_from_data(&css);
+         textview selection {{ background-color: {}; color: {}; }}\n\
+         .emax-palette {{ background-color: {}; }}\n\
+         .emax-palette scrolledwindow, .emax-palette list {{ background-color: transparent; }}\n\
+         .emax-palette row {{ padding: 6px 10px; border-radius: 8px; }}\n\
+         .emax-palette row:selected {{ background-color: {}; }}\n\
+         .emax-palette row:selected label {{ color: {}; }}\n\
+         .emax-section {{ color: {}; font-weight: bold; font-size: smaller; }}\n\
+         .emax-title {{ color: {}; }}\n\
+         .emax-snippet {{ color: {}; font-size: smaller; }}\n\
+         .emax-cmd {{ color: {}; }}\n\
+         .emax-entry {{ background-color: {}; color: {}; caret-color: {}; font-size: {}pt; \
+         border: 1px solid {}; border-radius: 8px; padding: 6px 8px; }}\n\
+         .emax-entry:focus {{ border-color: {}; outline: none; }}\n\
+         .emax-find {{ background-color: {}; border: 1px solid {}; border-radius: 8px; padding: 6px; }}\n\
+         .emax-find entry {{ background-color: transparent; color: {}; }}\n\
+         .emax-count {{ color: {}; font-size: smaller; }}\n",
+        t.background,
+        t.foreground,
+        t.accent,
+        t.font_size,
+        t.selection,
+        t.foreground,
+        t.background,
+        t.selection,
+        t.foreground,
+        t.muted,
+        t.foreground,
+        t.accent,
+        t.accent,
+        t.background,
+        t.foreground,
+        t.accent,
+        t.font_size,
+        t.muted,
+        t.accent,
+        t.background,
+        t.muted,
+        t.foreground,
+        t.muted,
+    )
+}
+
+fn apply_theme(provider: &gtk4::CssProvider, t: &Theme) {
+    provider.load_from_data(&theme_css(t));
 }
 
 // ---------- app state ----------
@@ -177,6 +222,10 @@ struct State {
     dialog_open: Cell<bool>,              // un solo diálogo de conflicto a la vez
     palette: RefCell<Option<PaletteUi>>,  // Some solo mientras la palette está abierta
     index: RefCell<Option<rusqlite::Connection>>, // FTS5 (main thread); None → palette solo títulos
+    overlay: gtk4::Overlay,               // hijo de la ventana; hijo principal = editor o preview
+    preview_on: Cell<bool>,
+    find: RefCell<Option<FindUi>>, // barra Ctrl+F, solo mientras está abierta
+    src: sourceview5::Buffer,      // mismo objeto que view.buffer() (SearchContext pide Buffer)
 }
 
 type Shared = Rc<State>;
@@ -265,6 +314,9 @@ fn set_text_silent(s: &Shared, text: &str, path: Option<PathBuf>) {
     *s.last_synced.borrow_mut() = path.map(|_| text.to_string());
     s.suppress.set(false);
     refresh_title(s);
+    if s.preview_on.get() {
+        show_preview(s); // re-renderiza; el source no cambió por el preview
+    }
 }
 
 fn flush_or_cancel(s: &Shared) {
@@ -804,6 +856,203 @@ fn cmd_query(text: &str) -> Option<String> {
         .map(|rest| rest.trim().to_lowercase())
 }
 
+// ---------- Fase 5: fns puras (checkbox, links, preview spans) ----------
+
+/// `- [ ]` ↔ `- [x]` preservando indentación. Vale `-`, `*`, `+`;
+/// `X` mayúscula cuenta como tildado. No-checklist → None.
+fn toggle_checkbox_line(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    let r = rest.as_bytes();
+    if r.len() < 5
+        || !(r[0] == b'-' || r[0] == b'*' || r[0] == b'+')
+        || r[1] != b' '
+        || r[2] != b'['
+        || r[4] != b']'
+    {
+        return None;
+    }
+    let toggled = match r[3] {
+        b' ' => 'x',
+        b'x' | b'X' => ' ',
+        _ => return None,
+    };
+    let mut out = String::with_capacity(line.len());
+    out.push_str(indent);
+    out.push(r[0] as char);
+    out.push_str(" [");
+    out.push(toggled);
+    out.push(']');
+    out.push_str(&rest[5..]); // seguro: los 5 primeros bytes son ASCII
+    Some(out)
+}
+
+/// Solo http(s)/mailto; resto se ignora. Corta en whitespace (`"title"`).
+fn valid_link_url(url: &str) -> Option<String> {
+    let u = url.split_whitespace().next().unwrap_or("");
+    if u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:") {
+        Some(u.to_string())
+    } else {
+        None
+    }
+}
+
+/// URL si `col` (chars) cae dentro de un `[texto](url)` de la línea.
+fn link_url_at(line: &str, col: usize) -> Option<String> {
+    let cs: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let Some(rel_close) = cs[i..].iter().position(|&c| c == ']') else {
+            i += 1;
+            continue;
+        };
+        let close = i + rel_close;
+        if cs.get(close + 1) != Some(&'(') {
+            i += 1;
+            continue;
+        }
+        let url_start = close + 2;
+        let Some(rel_end) = cs[url_start..].iter().position(|&c| c == ')') else {
+            i += 1;
+            continue;
+        };
+        let end = url_start + rel_end; // char idx de ')'
+        if col >= start && col <= end {
+            let url: String = cs[url_start..end].iter().collect();
+            return valid_link_url(&url);
+        }
+        i = end + 1;
+    }
+    None
+}
+
+// ---------- preview: pulldown-cmark → spans (puro, testeable) ----------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpanKind {
+    Text,
+    Heading(u8),
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Link,
+}
+
+#[derive(Clone, Debug)]
+struct Span {
+    text: String,
+    tags: Vec<SpanKind>,
+}
+
+/// Markdown → spans con tags. Sin WebView: el caller los vuelca a un
+/// TextBuffer read-only con TextTags (headings/bold/italic/listas
+/// tasklists/code/links). No hace panic con input arbitrario.
+fn preview_spans(md: &str) -> Vec<Span> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let mut spans: Vec<Span> = vec![];
+    let mut stack: Vec<SpanKind> = vec![];
+    let mut lists: Vec<Option<u64>> = vec![]; // None = bullets; Some(n) = ordered counter
+    let mut item_prefix_pending = false;
+
+    let mut push = |text: &str, tags: &[SpanKind], extra: Option<SpanKind>| {
+        if text.is_empty() {
+            return;
+        }
+        let mut t = tags.to_vec();
+        if let Some(k) = extra {
+            t.push(k);
+        }
+        if t.is_empty() {
+            t.push(SpanKind::Text);
+        }
+        spans.push(Span {
+            text: text.to_string(),
+            tags: t,
+        });
+    };
+    for ev in Parser::new_ext(md, opts) {
+        match ev {
+            Event::Start(Tag::Heading { level, .. }) => {
+                stack.push(SpanKind::Heading(level as u8));
+            }
+            Event::Start(Tag::Strong) => stack.push(SpanKind::Bold),
+            Event::Start(Tag::Emphasis) => stack.push(SpanKind::Italic),
+            Event::Start(Tag::Strikethrough) => stack.push(SpanKind::Strike),
+            Event::Start(Tag::Link { .. }) => stack.push(SpanKind::Link),
+            Event::Start(Tag::CodeBlock(_)) => stack.push(SpanKind::Code),
+            Event::Start(Tag::List(n)) => lists.push(n),
+            Event::Start(Tag::Item) => item_prefix_pending = true,
+            Event::Start(_) => {}
+            Event::End(TagEnd::Paragraph) => {
+                push("\n\n", &stack, None);
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                stack.retain(|k| !matches!(k, SpanKind::Heading(_)));
+                push("\n\n", &stack, None);
+            }
+            Event::End(TagEnd::Item) => {
+                item_prefix_pending = false;
+                push("\n", &stack, None);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                stack.retain(|k| *k != SpanKind::Code);
+                push("\n", &stack, None);
+            }
+            Event::End(TagEnd::Link) => {
+                stack.retain(|k| *k != SpanKind::Link);
+            }
+            Event::End(TagEnd::Strong) => {
+                stack.retain(|k| *k != SpanKind::Bold);
+            }
+            Event::End(TagEnd::Emphasis) => {
+                stack.retain(|k| *k != SpanKind::Italic);
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                stack.retain(|k| *k != SpanKind::Strike);
+            }
+            Event::End(_) => {}
+            Event::Text(t) => {
+                if item_prefix_pending {
+                    item_prefix_pending = false;
+                    match lists.last().copied() {
+                        Some(None) => push("• ", &stack, None),
+                        Some(Some(n)) => {
+                            let s = format!("{n}. ");
+                            lists.pop();
+                            lists.push(Some(n + 1));
+                            push(&s, &stack, None);
+                        }
+                        None => {}
+                    }
+                }
+                push(&t, &stack, None);
+            }
+            Event::Code(t) => {
+                push(&t, &stack, Some(SpanKind::Code));
+            }
+            Event::TaskListMarker(done) => {
+                item_prefix_pending = false;
+                push(if done { "☑ " } else { "☐ " }, &stack, None);
+            }
+            Event::SoftBreak | Event::HardBreak => push("\n", &stack, None),
+            Event::Rule => push("———\n", &stack, None),
+            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
+            Event::InlineMath(t) | Event::DisplayMath(t) => push(&t, &stack, Some(SpanKind::Code)),
+        }
+    }
+    spans
+}
+
 // ---------- palette Ctrl+K (overlay temporal, sin estado permanente) ----------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -881,13 +1130,15 @@ fn open_palette(s: &Shared) {
         .default_width(480)
         .resizable(false)
         .build();
+    win.add_css_class("emax-palette");
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
     vbox.set_margin_top(12);
     vbox.set_margin_bottom(12);
     vbox.set_margin_start(12);
     vbox.set_margin_end(12);
     let entry = gtk4::SearchEntry::new();
-    entry.set_placeholder_text(Some("Type to filter · `>` commands"));
+    entry.add_css_class("emax-entry");
+    entry.set_placeholder_text(Some("Filter notes · > for commands"));
     let scroll = gtk4::ScrolledWindow::new();
     scroll.set_min_content_height(320);
     let list = gtk4::ListBox::new();
@@ -987,7 +1238,7 @@ fn open_palette(s: &Shared) {
 fn pal_header(list: &gtk4::ListBox, text: &str) {
     let lbl = gtk4::Label::new(Some(text));
     lbl.set_xalign(0.0);
-    lbl.add_css_class("dim-label");
+    lbl.add_css_class("emax-section");
     let row = gtk4::ListBoxRow::new();
     row.set_child(Some(&lbl));
     row.set_selectable(false);
@@ -1005,6 +1256,7 @@ fn pal_add_note(pal: &PaletteUi, path: &PathBuf, title: &str, favorites: &[PathB
     lbl.set_xalign(0.0);
     lbl.set_hexpand(true);
     lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    lbl.add_css_class("emax-title");
     let row = gtk4::ListBoxRow::new();
     row.set_child(Some(&lbl));
     pal.list.append(&row);
@@ -1017,7 +1269,7 @@ fn pal_add_note(pal: &PaletteUi, path: &PathBuf, title: &str, favorites: &[PathB
 fn pal_add_cmd(pal: &PaletteUi, cmd: Cmd) {
     let lbl = gtk4::Label::new(Some(cmd.name()));
     lbl.set_xalign(0.0);
-    lbl.add_css_class("dim-label");
+    lbl.add_css_class("emax-cmd");
     let row = gtk4::ListBoxRow::new();
     row.set_child(Some(&lbl));
     pal.list.append(&row);
@@ -1040,7 +1292,7 @@ fn pal_add_content(pal: &PaletteUi, hit: &ContentHit, favorites: &[PathBuf]) {
     snip_lbl.set_markup(&fts_markup(&hit.snippet));
     snip_lbl.set_xalign(0.0);
     snip_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    snip_lbl.add_css_class("dim-label");
+    snip_lbl.add_css_class("emax-snippet");
     let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     vbox.append(&title_lbl);
     vbox.append(&snip_lbl);
@@ -1091,7 +1343,7 @@ fn refresh_palette(s: &Shared) {
                 }
             }
             if n == 0 {
-                pal_header(&pal.list, "No favorites yet — use `Toggle favorite`");
+                pal_header(&pal.list, "No favorites yet");
             }
         }
         PalMode::Recent => {
@@ -1274,6 +1526,319 @@ fn run_command(s: &Shared, cmd: Cmd) {
     }
 }
 
+// ---------- atajos propios: matching puro keyval/mods (testeable sin GUI) ----------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    ToggleCheckbox, // Ctrl+Enter
+    FindOpen,       // Ctrl+F
+    TogglePreview,  // Ctrl+Shift+P
+    NewNote,        // Ctrl+N (bubble, como hoy: vale con Shift)
+    TogglePalette,  // Ctrl+K (bubble, como hoy: vale con Shift)
+}
+
+/// Única fuente de verdad para los atajos con Ctrl. Causa raíz del bugfix:
+/// el Enter llega como Return, KP_Enter o ISO_Enter según layout/IME
+/// (Wayland); solo matchear Return dejaba pasar el evento al TextView,
+/// que insertaba el salto de línea. Para Ctrl+Shift+P se acepta `p`/`P`
+/// (con Shift exigido): en algunas configs el keysym llega en minúscula.
+fn ctrl_shortcut(keyval: gtk4::gdk::Key, mods: gtk4::gdk::ModifierType) -> Option<Shortcut> {
+    use gtk4::gdk::{Key, ModifierType};
+    if !mods.contains(ModifierType::CONTROL_MASK) {
+        return None;
+    }
+    let shift = mods.contains(ModifierType::SHIFT_MASK);
+    match keyval {
+        Key::Return | Key::KP_Enter | Key::ISO_Enter => Some(Shortcut::ToggleCheckbox),
+        Key::f | Key::F if !shift => Some(Shortcut::FindOpen),
+        Key::p | Key::P if shift => Some(Shortcut::TogglePreview),
+        Key::n | Key::N => Some(Shortcut::NewNote),
+        Key::k | Key::K => Some(Shortcut::TogglePalette),
+        _ => None,
+    }
+}
+
+// ---------- Fase 5 UI: find overlay, preview ----------
+
+struct FindUi {
+    bar: gtk4::Box,
+    entry: gtk4::SearchEntry,
+    count: gtk4::Label,
+    ctx: sourceview5::SearchContext,
+}
+
+fn find_rebuild_ctx(s: &Shared, text: &str) -> sourceview5::SearchContext {
+    let settings = sourceview5::SearchSettings::builder()
+        .wrap_around(true)
+        .search_text(text)
+        .build();
+    let ctx = sourceview5::SearchContext::new(&s.src, Some(&settings));
+    ctx.set_highlight(true);
+    ctx
+}
+
+fn find_refresh_count(s: &Shared) {
+    let f = s.find.borrow();
+    let Some(f) = f.as_ref() else { return };
+    let q = f.entry.text();
+    if q.is_empty() {
+        f.count.set_text("");
+        return;
+    }
+    let n = f.ctx.occurrences_count();
+    if n == 0 {
+        f.count.set_text("no match");
+    } else {
+        f.count.set_text(&format!("{n} matches"));
+    }
+}
+
+/// Salta al siguiente/anterior match desde la selección (o cursor).
+fn find_step(s: &Shared, forward: bool) {
+    let f = s.find.borrow();
+    let Some(f) = f.as_ref() else { return };
+    if f.entry.text().is_empty() {
+        return;
+    }
+    let buf = s.view.buffer();
+    let it = buf
+        .selection_bounds()
+        .map(|(a, b)| if forward { b } else { a })
+        .unwrap_or_else(|| buf.iter_at_mark(&buf.get_insert()));
+    let hit = if forward {
+        f.ctx.forward(&it)
+    } else {
+        f.ctx.backward(&it)
+    };
+    if let Some((mut ms, me, _)) = hit {
+        buf.select_range(&ms, &me);
+        s.view.scroll_to_iter(&mut ms, 0.0, false, 0.0, 0.0);
+    }
+    find_refresh_count(s);
+}
+
+fn find_open(s: &Shared) {
+    if let Some(f) = s.find.borrow().as_ref() {
+        f.entry.grab_focus();
+        return;
+    }
+    let buf = s.view.buffer();
+    let init = buf
+        .selection_bounds()
+        .map(|(a, b)| buf.text(&a, &b, false).to_string())
+        .filter(|t| !t.is_empty() && !t.contains('\n'))
+        .unwrap_or_default();
+    let ctx = find_rebuild_ctx(s, &init);
+
+    let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    bar.set_halign(gtk4::Align::Center);
+    bar.set_valign(gtk4::Align::Start);
+    bar.set_margin_top(8);
+    bar.add_css_class("osd");
+    bar.add_css_class("emax-find");
+    let entry = gtk4::SearchEntry::new();
+    entry.add_css_class("emax-entry");
+    entry.set_width_chars(36);
+    entry.set_placeholder_text(Some("Find in note"));
+    if !init.is_empty() {
+        entry.set_text(&init);
+    }
+    let count = gtk4::Label::new(None);
+    count.add_css_class("emax-count");
+    bar.append(&entry);
+    bar.append(&count);
+    s.overlay.add_overlay(&bar);
+
+    *s.find.borrow_mut() = Some(FindUi {
+        bar,
+        entry: entry.clone(),
+        count,
+        ctx,
+    });
+
+    // Search-as-you-type: reconstruye contexto (highlight rota con el nuevo).
+    {
+        let w = Rc::downgrade(s);
+        entry.connect_changed(move |e| {
+            if let Some(st) = w.upgrade() {
+                let text = e.text().to_string();
+                if let Some(f) = st.find.borrow_mut().as_mut() {
+                    f.ctx.set_highlight(false);
+                    f.ctx = find_rebuild_ctx(&st, &text);
+                }
+                if !text.is_empty() {
+                    find_step(&st, true);
+                } else {
+                    find_refresh_count(&st);
+                }
+            }
+        });
+    }
+    // Enter = siguiente, Shift+Enter = anterior, Esc = cerrar (stack overlay).
+    {
+        let key = gtk4::EventControllerKey::new();
+        key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let w = Rc::downgrade(s);
+        key.connect_key_pressed(move |_, keyval, _, mods| {
+            use gtk4::gdk::{Key, ModifierType};
+            let Some(st) = w.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if keyval == Key::Escape {
+                find_close(&st);
+                return glib::Propagation::Stop;
+            }
+            if keyval == Key::Return || keyval == Key::KP_Enter {
+                find_step(&st, !mods.contains(ModifierType::SHIFT_MASK));
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        entry.add_controller(key);
+    }
+
+    find_refresh_count(s);
+    if !init.is_empty() {
+        find_step(s, true);
+    }
+    entry.grab_focus();
+}
+
+fn find_close(s: &Shared) {
+    if let Some(f) = s.find.borrow_mut().take() {
+        f.ctx.set_highlight(false);
+        s.overlay.remove_overlay(&f.bar);
+    }
+    if !s.preview_on.get() {
+        s.view.grab_focus();
+    }
+}
+
+/// Ctrl+Enter sobre la línea actual: `- [ ]` ↔ `- [x]` en un solo undo.
+/// No-checklist o preview visible → nada.
+fn toggle_checkbox_current(s: &Shared) {
+    if s.preview_on.get() {
+        return;
+    }
+    let buf = s.view.buffer();
+    let ins = buf.iter_at_mark(&buf.get_insert());
+    let mut ls = ins.clone();
+    ls.set_line_offset(0);
+    let mut le = ls.clone();
+    le.forward_to_line_end();
+    let line = buf.text(&ls, &le, false).to_string();
+    if let Some(nl) = toggle_checkbox_line(&line) {
+        buf.begin_user_action();
+        buf.delete(&mut ls, &mut le);
+        buf.insert(&mut ls, &nl);
+        buf.end_user_action();
+    }
+}
+
+// ---------- preview Ctrl+Shift+P: render sin WebView ----------
+
+fn preview_tag_for<'a>(kind: SpanKind, t: &'a PreviewTags) -> Option<&'a gtk4::TextTag> {
+    match kind {
+        SpanKind::Text => None,
+        SpanKind::Heading(1) => t.h1.as_ref(),
+        SpanKind::Heading(2) => t.h2.as_ref(),
+        SpanKind::Heading(_) => t.h3.as_ref(),
+        SpanKind::Bold => t.bold.as_ref(),
+        SpanKind::Italic => t.italic.as_ref(),
+        SpanKind::Strike => t.strike.as_ref(),
+        SpanKind::Code => t.mono.as_ref(),
+        SpanKind::Link => t.link.as_ref(),
+    }
+}
+
+struct PreviewTags {
+    h1: Option<gtk4::TextTag>,
+    h2: Option<gtk4::TextTag>,
+    h3: Option<gtk4::TextTag>,
+    bold: Option<gtk4::TextTag>,
+    italic: Option<gtk4::TextTag>,
+    strike: Option<gtk4::TextTag>,
+    mono: Option<gtk4::TextTag>,
+    link: Option<gtk4::TextTag>,
+}
+
+/// Crea los tags sin panics: las props `weight`/`style` de GtkTextTag son
+/// gint (pasar el enum PangoWeight/PangoStyle crasheaba create_tag → NULL
+/// → expect → muerte del proceso). Un tag que falle se degrada a texto
+/// plano: ningún contenido/tema puede tumbar el preview.
+fn preview_make_tags(buf: &gtk4::TextBuffer, accent: &str, muted: &str) -> PreviewTags {
+    let tag =
+        |name: &str, props: &[(&str, &dyn glib::value::ToValue)]| buf.create_tag(Some(name), props);
+    PreviewTags {
+        h1: tag("h1", &[("scale", &1.5f64), ("weight", &700i32)]), // PANGO_WEIGHT_BOLD
+        h2: tag("h2", &[("scale", &1.3f64), ("weight", &700i32)]),
+        h3: tag("h3", &[("scale", &1.15f64), ("weight", &700i32)]),
+        bold: tag("bold", &[("weight", &700i32)]),
+        italic: tag("italic", &[("style", &gtk4::pango::Style::Italic)]),
+        strike: tag("strike", &[("strikethrough", &true)]),
+        mono: tag("mono", &[("family", &"monospace"), ("background", &muted)]),
+        link: tag("link", &[("foreground", &accent)]),
+    }
+}
+
+/// Vuelca spans a un buffer read-only. El preview NO toca el source buffer:
+/// no dispara autosave ni watcher-loop.
+fn render_preview(buf: &gtk4::TextBuffer, md: &str, accent: &str, muted: &str) {
+    let t = preview_make_tags(buf, accent, muted);
+    for sp in preview_spans(md) {
+        let tags: Vec<&gtk4::TextTag> = sp
+            .tags
+            .iter()
+            .filter_map(|k| preview_tag_for(*k, &t))
+            .collect();
+        buf.insert_with_tags(&mut buf.end_iter(), &sp.text, &tags);
+    }
+}
+
+fn show_preview(s: &Shared) {
+    let theme = load_theme();
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    let tv = gtk4::TextView::new();
+    tv.set_editable(false);
+    tv.set_cursor_visible(false);
+    tv.set_wrap_mode(gtk4::WrapMode::Word);
+    tv.set_top_margin(12);
+    tv.set_left_margin(12);
+    tv.set_right_margin(12);
+    tv.set_bottom_margin(12);
+    render_preview(&tv.buffer(), &buffer_text(s), &theme.accent, &theme.muted);
+    scroll.set_child(Some(&tv));
+    s.overlay.set_child(Some(&scroll));
+}
+
+fn toggle_preview(s: &Shared) {
+    if s.preview_on.get() {
+        s.preview_on.set(false);
+        s.overlay.set_child(Some(&s.view));
+        s.view.grab_focus();
+    } else {
+        find_close(s);
+        show_preview(s);
+        s.preview_on.set(true);
+    }
+}
+
+// ---------- links: Ctrl+click abre http(s)/mailto ----------
+
+fn link_at_point(view: &sourceview5::View, x: f64, y: f64) -> Option<String> {
+    let (bx, by) = view.window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
+    let it = view.iter_at_location(bx, by)?;
+    let buf = view.buffer();
+    let mut ls = it.clone();
+    ls.set_line_offset(0);
+    let mut le = ls.clone();
+    le.forward_to_line_end();
+    let line = buf.text(&ls, &le, false).to_string();
+    link_url_at(&line, it.line_offset() as usize)
+}
+
 fn show_new(s: &Shared) {
     maybe_refresh_theme(s);
     set_text_silent(s, "", None);
@@ -1333,7 +1898,9 @@ fn build_ui(app: &gtk4::Application) -> Shared {
     view.set_left_margin(12);
     view.set_right_margin(12);
     view.set_bottom_margin(12);
-    window.set_child(Some(&view));
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&view)); // hijo principal: editor (o preview en Fase 5)
+    window.set_child(Some(&overlay));
 
     // Tema mínimo aplicado al display.
     let css = gtk4::CssProvider::new();
@@ -1377,6 +1944,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
     let st = Rc::new(State {
         window,
         view,
+        src: buf,
         path: RefCell::new(None),
         save_src: RefCell::new(None),
         suppress: Cell::new(false),
@@ -1386,6 +1954,9 @@ fn build_ui(app: &gtk4::Application) -> Shared {
         dialog_open: Cell::new(false),
         palette: RefCell::new(None),
         index: RefCell::new(None),
+        overlay,
+        preview_on: Cell::new(false),
+        find: RefCell::new(None),
     });
 
     // Índice FTS: abre/crea + sync; si falla, la palette sigue con títulos.
@@ -1419,20 +1990,81 @@ fn build_ui(app: &gtk4::Application) -> Shared {
     // Autosave con debounce.
     {
         let s = st.clone();
-        st.view.buffer().connect_changed(move |_| schedule_save(&s));
+        st.view.buffer().connect_changed(move |_| {
+            schedule_save(&s);
+        });
+    }
+    // Ctrl+click sobre [texto](url) → browser (solo http(s)/mailto).
+    // En Capture para que el click no mueva el cursor/selección al abrir link.
+    {
+        let click = gtk4::GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let w = Rc::downgrade(&st);
+        click.connect_pressed(move |g, _, x, y| {
+            use gtk4::gdk::ModifierType;
+            let Some(s) = w.upgrade() else { return };
+            if s.preview_on.get() {
+                return;
+            }
+            if !g.current_event_state().contains(ModifierType::CONTROL_MASK) {
+                return;
+            }
+            if let Some(url) = link_at_point(&s.view, x, y) {
+                if gtk4::gio::AppInfo::launch_default_for_uri(
+                    &url,
+                    None::<&gtk4::gio::AppLaunchContext>,
+                )
+                .is_ok()
+                {
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                }
+            }
+        });
+        st.view.add_controller(click);
+    }
+    // Atajos propios: el controller va en Capture (el TextView consumiría
+    // Return en bubble). Fuente de verdad: ctrl_shortcut (testeado).
+    {
+        let cap = gtk4::EventControllerKey::new();
+        cap.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let s = st.clone();
+        cap.connect_key_pressed(move |_, keyval, _, mods| {
+            match ctrl_shortcut(keyval, mods) {
+                Some(Shortcut::ToggleCheckbox) => {
+                    toggle_checkbox_current(&s);
+                    glib::Propagation::Stop
+                }
+                Some(Shortcut::FindOpen) => {
+                    find_open(&s);
+                    glib::Propagation::Stop
+                }
+                Some(Shortcut::TogglePreview) => {
+                    toggle_preview(&s);
+                    glib::Propagation::Stop
+                }
+                // NewNote/TogglePalette los resuelve el controller bubble (sin cambios).
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        st.window.add_controller(cap);
     }
     // Esc → hide (descarta vacío sin guardar); Ctrl+N → buffer vacío nuevo.
     {
         let key = gtk4::EventControllerKey::new();
         let s = st.clone();
         key.connect_key_pressed(move |_, keyval, _, mods| {
-            use gtk4::gdk::{Key, ModifierType};
+            use gtk4::gdk::Key;
             if keyval == Key::Escape {
+                if s.find.borrow().is_some() {
+                    find_close(&s); // stack: overlay > palette > hide app
+                    return glib::Propagation::Stop;
+                }
                 flush_or_cancel(&s);
                 s.window.set_visible(false);
                 return glib::Propagation::Stop;
             }
-            if mods.contains(ModifierType::CONTROL_MASK) && (keyval == Key::n || keyval == Key::N) {
+            if matches!(ctrl_shortcut(keyval, mods), Some(Shortcut::NewNote)) {
                 flush_or_cancel(&s);
                 if !buffer_text(&s).is_empty() {
                     save_now(&s);
@@ -1441,7 +2073,7 @@ fn build_ui(app: &gtk4::Application) -> Shared {
                 s.view.grab_focus();
                 return glib::Propagation::Stop;
             }
-            if mods.contains(ModifierType::CONTROL_MASK) && (keyval == Key::k || keyval == Key::K) {
+            if matches!(ctrl_shortcut(keyval, mods), Some(Shortcut::TogglePalette)) {
                 toggle_palette(&s); // abierta → la cierra
                 return glib::Propagation::Stop;
             }
@@ -1675,7 +2307,6 @@ mod tests {
     // ---------- Fase 4: builder + recall FTS ----------
 
     use super::{build_match, delete_doc, init_db, search_content, upsert_doc, ContentHit};
-
     fn mem_index(docs: &[(&str, &str, &str)]) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -1778,6 +2409,300 @@ mod tests {
             "{}",
             hits[0].snippet
         );
+    }
+
+    // ---------- Fase 5: checkbox, links, preview ----------
+
+    use super::{link_url_at, preview_spans, toggle_checkbox_line, SpanKind};
+
+    #[test]
+    fn checkbox_ida() {
+        assert_eq!(
+            toggle_checkbox_line("- [ ] tarea"),
+            Some("- [x] tarea".into())
+        );
+    }
+
+    #[test]
+    fn checkbox_vuelta() {
+        assert_eq!(
+            toggle_checkbox_line("- [x] tarea"),
+            Some("- [ ] tarea".into())
+        );
+        assert_eq!(
+            toggle_checkbox_line("- [X] tarea"),
+            Some("- [ ] tarea".into())
+        );
+    }
+
+    #[test]
+    fn checkbox_indent_y_variantes() {
+        assert_eq!(
+            toggle_checkbox_line("  * [ ] ind"),
+            Some("  * [x] ind".into())
+        );
+        assert_eq!(toggle_checkbox_line("+ [x] y"), Some("+ [ ] y".into()));
+        assert_eq!(
+            toggle_checkbox_line("- [ ] con resto [bracket] ok"),
+            Some("- [x] con resto [bracket] ok".into())
+        );
+    }
+
+    #[test]
+    fn checkbox_no_checklist_intacta() {
+        assert_eq!(toggle_checkbox_line("texto plano"), None);
+        assert_eq!(toggle_checkbox_line("- item sin box"), None);
+        assert_eq!(toggle_checkbox_line("- [y] letra rara"), None);
+        assert_eq!(toggle_checkbox_line("- [ ]"), Some("- [x]".into()));
+    }
+
+    // ---------- bugfix atajos: ctrl_shortcut ----------
+
+    use super::{ctrl_shortcut, Shortcut};
+
+    fn mods(ctrl: bool, shift: bool) -> gtk4::gdk::ModifierType {
+        use gtk4::gdk::ModifierType;
+        let mut m = ModifierType::empty();
+        if ctrl {
+            m.insert(ModifierType::CONTROL_MASK);
+        }
+        if shift {
+            m.insert(ModifierType::SHIFT_MASK);
+        }
+        m
+    }
+
+    #[test]
+    fn shortcut_enter_todas_variantes() {
+        use gtk4::gdk::Key;
+        let c = mods(true, false);
+        assert_eq!(
+            ctrl_shortcut(Key::Return, c),
+            Some(Shortcut::ToggleCheckbox)
+        );
+        assert_eq!(
+            ctrl_shortcut(Key::KP_Enter, c),
+            Some(Shortcut::ToggleCheckbox)
+        );
+        assert_eq!(
+            ctrl_shortcut(Key::ISO_Enter, c),
+            Some(Shortcut::ToggleCheckbox)
+        );
+        assert_eq!(ctrl_shortcut(Key::Return, mods(false, false)), None);
+    }
+
+    #[test]
+    fn shortcut_preview_ambos_cases() {
+        use gtk4::gdk::Key;
+        let cs = mods(true, true);
+        assert_eq!(ctrl_shortcut(Key::P, cs), Some(Shortcut::TogglePreview));
+        assert_eq!(ctrl_shortcut(Key::p, cs), Some(Shortcut::TogglePreview));
+        assert_eq!(ctrl_shortcut(Key::p, mods(true, false)), None);
+        assert_eq!(ctrl_shortcut(Key::P, mods(false, true)), None);
+    }
+
+    #[test]
+    fn shortcut_resto_intacto() {
+        use gtk4::gdk::Key;
+        assert_eq!(
+            ctrl_shortcut(Key::f, mods(true, false)),
+            Some(Shortcut::FindOpen)
+        );
+        assert_eq!(
+            ctrl_shortcut(Key::F, mods(true, false)),
+            Some(Shortcut::FindOpen)
+        );
+        assert_eq!(ctrl_shortcut(Key::F, mods(true, true)), None);
+        assert_eq!(
+            ctrl_shortcut(Key::n, mods(true, false)),
+            Some(Shortcut::NewNote)
+        );
+        assert_eq!(
+            ctrl_shortcut(Key::N, mods(true, true)),
+            Some(Shortcut::NewNote)
+        );
+        assert_eq!(
+            ctrl_shortcut(Key::k, mods(true, false)),
+            Some(Shortcut::TogglePalette)
+        );
+        assert_eq!(ctrl_shortcut(Key::x, mods(true, false)), None);
+        assert_eq!(ctrl_shortcut(Key::a, mods(false, false)), None);
+    }
+
+    #[test]
+    fn link_validos() {
+        let line = "ver [docs](https://example.com/a) por favor";
+        assert_eq!(link_url_at(line, 6), Some("https://example.com/a".into()));
+        assert_eq!(link_url_at(line, 27), Some("https://example.com/a".into()));
+        assert_eq!(
+            link_url_at("mail [yo](mailto:yo@x.com) fin", 8),
+            Some("mailto:yo@x.com".into())
+        );
+    }
+
+    #[test]
+    fn link_invalidos() {
+        let line = "ver [docs](https://example.com/a) fin";
+        assert_eq!(link_url_at(line, 0), None);
+        assert_eq!(link_url_at(line, 33), None);
+        assert_eq!(link_url_at("[ftp](ftp://x.com/f)", 3), None);
+        assert_eq!(link_url_at("[rel](/notas/otra)", 3), None);
+        assert_eq!(link_url_at("sin links acá", 4), None);
+        assert_eq!(link_url_at("[roto](https://x.com", 3), None);
+    }
+
+    #[test]
+    fn preview_heading_bold() {
+        let spans = preview_spans("# Hola\n\nun **bold** y *itálica*.\n");
+        let h = spans.iter().find(|s| s.text.contains("Hola")).unwrap();
+        assert!(h.tags.contains(&SpanKind::Heading(1)));
+        let b = spans.iter().find(|s| s.text == "bold").unwrap();
+        assert!(b.tags.contains(&SpanKind::Bold));
+        let i = spans.iter().find(|s| s.text == "itálica").unwrap();
+        assert!(i.tags.contains(&SpanKind::Italic));
+    }
+
+    #[test]
+    fn preview_tasklist_y_code() {
+        let spans = preview_spans("- [ ] pendiente\n- [x] hecha\n\n`code` fin\n");
+        assert!(spans.iter().any(|s| s.text.contains("☐")));
+        assert!(spans.iter().any(|s| s.text.contains("☑")));
+        let c = spans.iter().find(|s| s.text == "code").unwrap();
+        assert!(c.tags.contains(&SpanKind::Code));
+    }
+
+    #[test]
+    fn preview_no_panic() {
+        for md in [
+            "",
+            "   \n",
+            "#",
+            "[[[",
+            "]((",
+            "- [ ]",
+            "```\ncode\n```",
+            "> quote\n\n| a |\n|---|\n| b |",
+        ] {
+            let _ = preview_spans(md);
+        }
+    }
+
+    // ---------- bugfix crash preview: adversariales ----------
+
+    use super::render_preview;
+    use gtk4::prelude::TextBufferExt as _;
+
+    #[test]
+    fn preview_adversarial_spans() {
+        let cases = [
+            "",
+            "   \n",
+            "#",
+            "## ",
+            "# Hola, ¿cómo estás? ñandú",
+            "emoji 🎉🚀 ñ á é í ó ú ü 中文",
+            "a & b <c> \"q\" 's' &amp; &lt;",
+            "```\ncode sin cerrar",
+            "```rust\nfn main() {}\n```\n",
+            "````\nfence largo sin cerrar",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| rota |",
+            "| sin cierre",
+            "- [ ]",
+            "> quote",
+            "***",
+            "---",
+            "[a](b)",
+            "![i](u)",
+            "[t](https://x.com \"título\")",
+            "texto con \t tabs",
+            "#eading sin espacio",
+            "####### siete niveles",
+            "para1\nlínea suelta sin blank\npara2?",
+        ];
+        for md in cases {
+            let spans = preview_spans(md);
+            let _: Vec<(&str, usize)> = spans
+                .iter()
+                .map(|s| (s.text.as_str(), s.tags.len()))
+                .collect();
+        }
+    }
+
+    #[test]
+    fn preview_nota_grande() {
+        let big = "# Título con tildes: configuración\n\n".to_string()
+            + &"párrafo con ñ y emoji 🎉 repetido. ".repeat(20000);
+        assert!(big.len() > 500_000);
+        let spans = preview_spans(&big);
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn preview_render_headless() {
+        if gtk4::init().is_err() {
+            eprintln!("SKIP preview_render_headless: sin display");
+            return;
+        }
+        // TextBuffer/TextTag son GObjects sin display: funciona headless.
+        let buf = gtk4::TextBuffer::new(None);
+        render_preview(
+            &buf,
+            "# Hola ñ 🎉\n\n**bold** `code` [l](https://x.com)\n",
+            "#888888",
+            "#4B4E55",
+        );
+        let (a, b) = (buf.start_iter(), buf.end_iter());
+        assert!(buf.text(&a, &b, false).contains("Hola"));
+        // Nota nueva sin guardar: render vacío sin panic.
+        let buf = gtk4::TextBuffer::new(None);
+        render_preview(&buf, "", "#888888", "#4B4E55");
+        let (a, b) = (buf.start_iter(), buf.end_iter());
+        assert!(buf.text(&a, &b, false).is_empty());
+    }
+
+    #[test]
+    fn preview_render_colores_basura() {
+        if gtk4::init().is_err() {
+            eprintln!("SKIP preview_render_colores_basura: sin display");
+            return;
+        }
+        // colors.toml arbitrario no puede tumbar el proceso.
+        let buf = gtk4::TextBuffer::new(None);
+        render_preview(&buf, "# Hola\ntexto **bold**\n", "notacolor!!!", "");
+        let buf = gtk4::TextBuffer::new(None);
+        render_preview(&buf, "# Hola\n", "literal raro", "también-malo");
+    }
+
+    #[test]
+    fn theme_css_usa_tokens() {
+        use super::{theme_css, Theme};
+        let t = Theme {
+            background: "#000000".into(),
+            foreground: "#FFFFFF".into(),
+            accent: "#888888".into(),
+            selection: "#343D41".into(),
+            muted: "#4B4E55".into(),
+            font_size: 12,
+        };
+        let css = theme_css(&t);
+        for tok in [
+            "#000000", "#FFFFFF", "#888888", "#343D41", "#4B4E55", "12pt",
+        ] {
+            assert!(css.contains(tok), "falta {tok}");
+        }
+        for cls in [
+            ".emax-palette",
+            ".emax-entry",
+            ".emax-section",
+            ".emax-title",
+            ".emax-snippet",
+            ".emax-cmd",
+            ".emax-find",
+            ".emax-count",
+            "row:selected",
+        ] {
+            assert!(css.contains(cls), "falta {cls}");
+        }
     }
 
     #[test]

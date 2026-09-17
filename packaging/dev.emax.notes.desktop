@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=emax-notes
+Comment=Bloc de notas local-first para Hyprland (Super+N)
+Exec=emax-notes toggle-new
+TryExec=emax-notes
+Terminal=false
+Icon=accessories-text-editor
+Categories=Utility;TextEditor;
+StartupWMClass=dev.emax.notes

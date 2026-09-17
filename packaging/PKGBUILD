@@ -1,0 +1,38 @@
+# Maintainer: emacuello
+# PKGBUILD local (Fase 6, spec #48): compila el árbol que contiene a packaging/.
+# Vive en packaging/ (no en la raíz) para que $srcdir de makepkg no colisione
+# con src/ del repo. Para AUR: mover a su propio repo y cambiar source= al
+# tarball del tag (ver comentario abajo), más sha256sums reales.
+pkgname=emax-notes
+pkgver=0.1.0 # en sync con Cargo.toml [package] version
+pkgrel=1
+pkgdesc="Bloc de notas local-first, keyboard-first para Hyprland/Wayland (GTK4)"
+arch=('x86_64')
+url="https://github.com/emacuello/emax_notes"
+license=('custom') # repo sin archivo LICENSE ni id SPDX aún; pendiente elegir licencia
+depends=('gtk4' 'gtksourceview5')
+# NOTA sqlite: rusqlite va con feature "bundled" (sqlite estático compilado por
+# libsqlite3-sys; el binario NO tiene NEEDED directo a libsqlite3.so.0 —
+# verificado con readelf -d). El libsqlite3.so.0 que muestra ldd llega vía
+# libgtk-4/libgtksourceview-5, ya cubierto por depends. No listar sqlite.
+makedepends=('cargo' 'pkgconf' 'git')
+# rusqlite "bundled" compila sqlite3.c vía cc(1) heredando CFLAGS de makepkg:
+# con lto, -flto=auto genera objetos LTO de GCC que rust-lld no sabe enlazar
+# (undefined symbol: sqlite3_*). Se desactiva solo lto; el resto de flags
+# de distro se conserva.
+options=('!lto')
+source=() # build local; en AUR: ("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  cargo build --release --locked
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 target/release/emax-notes "$pkgdir/usr/bin/emax-notes"
+  install -Dm644 packaging/dev.emax.notes.desktop "$pkgdir/usr/share/applications/dev.emax.notes.desktop"
+  # Sin icono propio en el repo: el .desktop usa icono stock
+  # (accessories-text-editor, provisto por adwaita-icon-theme vía gtk4).
+}

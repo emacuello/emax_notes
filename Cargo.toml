@@ -16,3 +16,4 @@ notify-debouncer-mini = "0.7"
 futures-channel = "0.3" # ya en el árbol (transitivo de glib); canal watcher→main loop
 futures-core = "0.3" # idem; trait Stream para sondear el canal sin polling
 rusqlite = { version = "0.32", features = ["bundled"] } # FTS5 (unicode61, sin porter/trigram); índice descartable en cache XDG
+pulldown-cmark = { version = "0.12", features = ["simd"] } # preview sin WebView
