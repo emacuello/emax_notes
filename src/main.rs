@@ -1,212 +1,36 @@
-use directories::UserDirs;
-use gtk4::gio::prelude::*;
-use gtk4::prelude::*;
-use sourceview5::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
-// ---------- paths ----------
+use gtk4::gio::prelude::*;
+use gtk4::prelude::*;
+use sourceview5::prelude::*;
 
-fn notes_dir() -> PathBuf {
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
-    let dir = home.join("Notes");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+mod index;
+mod markdown;
+mod notes;
+mod palette;
+mod theme;
 
-fn stamp() -> String {
-    glib::DateTime::now_local()
-        .ok()
-        .and_then(|dt| dt.format("%Y%m%d-%H%M%S").ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "00000000-000000".into())
-}
-
-fn new_note_path() -> PathBuf {
-    notes_dir().join(format!("{}.md", stamp()))
-}
-
-fn last_note() -> Option<PathBuf> {
-    let dir = notes_dir();
-    std::fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false)) // flat Fase 2: ignora subdirectorios
-        .max() // YYYYMMDD-HHMMSS.md ordena lexicográficamente
-}
-
-// ---------- título derivado (Fase 2, spec #20, fn pura) ----------
-
-fn truncate_title(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    } else {
-        s.to_string()
-    }
-}
-
-/// Primer heading (`# `, `## `…: strip `#` + trim) → si no hay, primera línea
-/// no vacía (trim, máx 60 + `…`) → si vacío, `"Untitled"`.
-/// Sin frontmatter en Fase 2: un `---` inicial cuenta como línea normal.
-fn derive_title(text: &str) -> String {
-    let mut fallback: Option<&str> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        if t.starts_with('#') {
-            let h = t.trim_start_matches('#').trim();
-            if !h.is_empty() {
-                return h.to_string();
-            }
-            continue;
-        }
-        if fallback.is_none() {
-            fallback = Some(t);
-        }
-    }
-    match fallback {
-        Some(f) => truncate_title(f, 60),
-        None => "Untitled".into(),
-    }
-}
-
-// ---------- theme (Fase 1: mínimo, tolerante, re-lee por mtime) ----------
-
-#[derive(Clone)]
-struct Theme {
-    background: String,
-    foreground: String,
-    accent: String,
-    selection: String,
-    muted: String,
-    font_size: i64,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            background: "#000000".into(),
-            foreground: "#FFFFFF".into(),
-            accent: "#888888".into(),
-            selection: "#343D41".into(),
-            muted: "#4B4E55".into(),
-            font_size: 12,
-        }
-    }
-}
-
-fn theme_files() -> (PathBuf, PathBuf) {
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
-    (
-        home.join(".local/state/omarchy/current/theme/colors.toml"),
-        home.join(".local/state/omarchy/current/theme/shell.toml"),
-    )
-}
-
-fn colors_mtime() -> Option<SystemTime> {
-    let (colors, _) = theme_files();
-    std::fs::metadata(colors).and_then(|m| m.modified()).ok()
-}
-
-fn load_theme() -> Theme {
-    let mut t = Theme::default();
-    let (colors_path, shell_path) = theme_files();
-    if let Ok(txt) = std::fs::read_to_string(&colors_path) {
-        if let Ok(v) = txt.parse::<toml::Value>() {
-            let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
-            if let Some(s) = get("background") {
-                t.background = s;
-            }
-            if let Some(s) = get("foreground").or_else(|| get("fg")) {
-                t.foreground = s;
-            }
-            if let Some(s) = get("accent") {
-                t.accent = s;
-            }
-            if let Some(s) = get("selection").or_else(|| get("selection_background")) {
-                t.selection = s;
-            }
-            if let Some(s) = get("muted") {
-                t.muted = s;
-            }
-        }
-    }
-    if let Ok(txt) = std::fs::read_to_string(&shell_path) {
-        if let Ok(v) = txt.parse::<toml::Value>() {
-            if let Some(n) = v
-                .get("font")
-                .and_then(|f| f.get("base-size"))
-                .and_then(|x| x.as_integer())
-            {
-                if (8..=32).contains(&n) {
-                    t.font_size = n;
-                }
-            }
-        }
-    }
-    t
-}
-
-fn theme_css(t: &Theme) -> String {
-    format!(
-        "window, textview, textview text {{ background-color: {}; color: {}; caret-color: {}; font-size: {}pt; }}\n\
-         textview selection {{ background-color: {}; color: {}; }}\n\
-         .emax-palette {{ background-color: {}; }}\n\
-         .emax-palette scrolledwindow, .emax-palette list {{ background-color: transparent; }}\n\
-         .emax-palette row {{ padding: 6px 10px; border-radius: 8px; }}\n\
-         .emax-palette row:selected {{ background-color: {}; }}\n\
-         .emax-palette row:selected label {{ color: {}; }}\n\
-         .emax-section {{ color: {}; font-weight: bold; font-size: smaller; }}\n\
-         .emax-title {{ color: {}; }}\n\
-         .emax-snippet {{ color: {}; font-size: smaller; }}\n\
-         .emax-cmd {{ color: {}; }}\n\
-         .emax-entry {{ background-color: {}; color: {}; caret-color: {}; font-size: {}pt; \
-         border: 1px solid {}; border-radius: 8px; padding: 6px 8px; }}\n\
-         .emax-entry:focus {{ border-color: {}; outline: none; }}\n\
-         .emax-find {{ background-color: {}; border: 1px solid {}; border-radius: 8px; padding: 6px; }}\n\
-         .emax-find entry {{ background-color: transparent; color: {}; }}\n\
-         .emax-count {{ color: {}; font-size: smaller; }}\n",
-        t.background,
-        t.foreground,
-        t.accent,
-        t.font_size,
-        t.selection,
-        t.foreground,
-        t.background,
-        t.selection,
-        t.foreground,
-        t.muted,
-        t.foreground,
-        t.accent,
-        t.accent,
-        t.background,
-        t.foreground,
-        t.accent,
-        t.font_size,
-        t.muted,
-        t.accent,
-        t.background,
-        t.muted,
-        t.foreground,
-        t.muted,
-    )
-}
-
-fn apply_theme(provider: &gtk4::CssProvider, t: &Theme) {
-    provider.load_from_data(&theme_css(t));
-}
+#[cfg(test)]
+use index::init_db;
+use index::{
+    build_match, delete_doc, favs_json, file_mtime_secs, index_fresh, now_secs, open_index,
+    search_content, upsert_doc, ContentHit,
+};
+use markdown::{derive_title, link_url_at, preview_spans, toggle_checkbox_line, SpanKind};
+use notes::{
+    is_markdown_file, last_note, load_state, new_note_path, notes_dir, remove_from_state,
+    toggle_favorite, touch_recent,
+};
+use palette::{cmd_query, filter_notes, Cmd, NoteEntry};
+#[cfg(test)]
+use theme::theme_css;
+#[cfg(test)]
+use theme::Theme;
+use theme::{apply_theme, colors_mtime, load_theme};
 
 // ---------- app state ----------
 
@@ -249,16 +73,18 @@ fn maybe_refresh_theme(s: &Shared) {
 }
 
 // Guardado atómico: tempfile write → fsync → persist. No crea archivo si vacío.
-fn save_now(s: &Shared) {
+fn save_now(s: &Shared) -> bool {
     *s.save_src.borrow_mut() = None;
     let text = buffer_text(s);
     if text.is_empty() {
-        return; // lazy: vacío nunca toca disco
+        return true; // lazy: vacío nunca toca disco
     }
     if s.path.borrow().is_none() {
         *s.path.borrow_mut() = Some(new_note_path());
     }
-    let path = s.path.borrow().clone().unwrap();
+    let Some(path) = s.path.borrow().clone() else {
+        return false;
+    };
     let dir = notes_dir();
     let r: Result<(), Box<dyn std::error::Error>> = (|| {
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
@@ -271,10 +97,12 @@ fn save_now(s: &Shared) {
     })();
     if let Err(e) = r {
         eprintln!("[emax-notes] save error {path:?}: {e}");
+        false
     } else {
-        *s.last_synced.borrow_mut() = Some(text.clone());
         touch_recent(&path);
         index_upsert_path(s, &path, &text);
+        *s.last_synced.borrow_mut() = Some(text);
+        true
     }
 }
 
@@ -319,18 +147,21 @@ fn set_text_silent(s: &Shared, text: &str, path: Option<PathBuf>) {
     }
 }
 
-fn flush_or_cancel(s: &Shared) {
+fn flush_or_cancel(s: &Shared) -> bool {
     // Al ocultar: si hay texto pendiente se guarda ya; si vacío se descarta.
     if buffer_text(s).is_empty() {
         if let Some(id) = s.save_src.borrow_mut().take() {
             id.remove();
         }
         *s.path.borrow_mut() = None;
+        true
     } else if s.save_src.borrow().is_some() {
         if let Some(id) = s.save_src.borrow_mut().take() {
             id.remove();
         }
-        save_now(s);
+        save_now(s)
+    } else {
+        true
     }
 }
 
@@ -389,6 +220,9 @@ fn ask_conflict(s: &Shared) {
         return; // un solo diálogo; el reload lee disco fresco al confirmar
     }
     s.dialog_open.set(true);
+    if let Some(id) = s.save_src.borrow_mut().take() {
+        id.remove();
+    }
     let dlg = gtk4::AlertDialog::builder()
         .message("La nota cambió en disco")
         .detail("Tenés cambios sin guardar. ¿Recargar la versión externa o conservar la tuya?")
@@ -402,7 +236,8 @@ fn ask_conflict(s: &Shared) {
             st.dialog_open.set(false);
             if resp == Ok(0) {
                 // Reload external
-                if let Some(path) = st.path.borrow().clone() {
+                let path = st.path.borrow().clone();
+                if let Some(path) = path {
                     match std::fs::read_to_string(&path) {
                         Ok(disk) => {
                             set_text_silent(&st, &disk, Some(path));
@@ -415,367 +250,14 @@ fn ask_conflict(s: &Shared) {
                 }
             } else {
                 // Keep mine (resp == 1; Err o -1 = descartado → también conserva)
-                save_now(&st);
-                eprintln!("[emax-notes] conflicto: keep mine (guardado)");
+                if save_now(&st) {
+                    eprintln!("[emax-notes] conflicto: keep mine (guardado)");
+                } else {
+                    eprintln!("[emax-notes] conflicto: no se pudo guardar");
+                }
             }
         },
     );
-}
-
-// ---------- estado XDG (Fase 3): ~/.local/state/emax-notes/state.toml ----------
-// Los .md no se tocan: recents/favoritos viven acá, cero ruido git.
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct NotesState {
-    recent: Vec<PathBuf>,    // más reciente primero, máx 20
-    favorites: Vec<PathBuf>, // sin orden garantizado
-}
-
-fn state_path() -> PathBuf {
-    let base = directories::BaseDirs::new()
-        .and_then(|b| b.state_dir().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-                .join(".local/state")
-        });
-    base.join("emax-notes/state.toml")
-}
-
-fn load_state() -> NotesState {
-    let mut st: NotesState = std::fs::read_to_string(state_path())
-        .ok()
-        .and_then(|txt| toml::from_str(&txt).ok())
-        .unwrap_or_default();
-    st.recent.retain(|p| p.is_file()); // purga lo que ya no existe
-    st.favorites.retain(|p| p.is_file());
-    st.recent.truncate(20);
-    st
-}
-
-fn save_state(st: &NotesState) {
-    let path = state_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match toml::to_string(st) {
-        Ok(txt) => {
-            if let Err(e) = std::fs::write(&path, txt) {
-                eprintln!("[emax-notes] state write error: {e}");
-            }
-        }
-        Err(e) => eprintln!("[emax-notes] state serialize error: {e}"),
-    }
-}
-
-fn touch_recent(path: &PathBuf) {
-    let mut st = load_state();
-    if st.recent.first() == Some(path) {
-        return; // ya es recent[0]: sin IO extra
-    }
-    st.recent.retain(|p| p != path);
-    st.recent.insert(0, path.clone());
-    st.recent.truncate(20);
-    save_state(&st);
-}
-
-fn toggle_favorite(path: &PathBuf) -> bool {
-    let mut st = load_state();
-    let fav = if st.favorites.iter().any(|p| p == path) {
-        st.favorites.retain(|p| p != path);
-        false
-    } else {
-        st.favorites.push(path.clone());
-        true
-    };
-    save_state(&st);
-    fav
-}
-
-fn remove_from_state(path: &PathBuf) {
-    let mut st = load_state();
-    st.recent.retain(|p| p != path);
-    st.favorites.retain(|p| p != path);
-    save_state(&st);
-}
-
-// ---------- índice FTS5 (Fase 4): descartable en ~/.cache/emax-notes/search-index/ ----------
-// rusqlite bundled trae FTS5. V1: `unicode61 remove_diacritics 2`, SIN porter,
-// SIN trigram, SIN prefix=. Los .md son la fuente de verdad; borrar el cache
-// nunca pierde notas (rebuild por escaneo). Incremental: save_now + watcher.
-
-fn cache_index_path() -> PathBuf {
-    let base = directories::BaseDirs::new()
-        .map(|b| b.cache_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join(".cache")
-        });
-    base.join("emax-notes/search-index/index.db")
-}
-
-fn file_mtime_secs(p: &PathBuf) -> i64 {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn db_mtime(conn: &rusqlite::Connection, path: &str) -> Option<i64> {
-    conn.query_row(
-        "SELECT updated_at FROM docs WHERE path = ?",
-        [path],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
-/// El índice ya refleja este archivo: no abrir (inotify OPEN retriggería el watcher).
-fn index_fresh(conn: &rusqlite::Connection, path: &PathBuf) -> bool {
-    path.is_file() && db_mtime(conn, &path.to_string_lossy()) == Some(file_mtime_secs(path))
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn init_db(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS docs(
-           id INTEGER PRIMARY KEY,
-           path TEXT UNIQUE NOT NULL,
-           title TEXT NOT NULL,
-           content TEXT NOT NULL,
-           updated_at INTEGER NOT NULL);
-         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-           title, content, content='docs', content_rowid='id',
-           tokenize='unicode61 remove_diacritics 2');
-         CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
-           INSERT INTO notes_fts(rowid, title, content)
-           VALUES (new.id, new.title, new.content);
-         END;
-         CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
-           INSERT INTO notes_fts(notes_fts, rowid, title, content)
-           VALUES ('delete', old.id, old.title, old.content);
-         END;
-         CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
-           INSERT INTO notes_fts(notes_fts, rowid, title, content)
-           VALUES ('delete', old.id, old.title, old.content);
-           INSERT INTO notes_fts(rowid, title, content)
-           VALUES (new.id, new.title, new.content);
-         END;",
-    )
-}
-
-fn upsert_doc(
-    conn: &rusqlite::Connection,
-    path: &str,
-    title: &str,
-    content: &str,
-    updated: i64,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO docs(path, title, content, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(path) DO UPDATE SET
-           title = excluded.title, content = excluded.content,
-           updated_at = excluded.updated_at",
-        rusqlite::params![path, title, content, updated],
-    )
-    .map(|_| ())
-}
-
-fn delete_doc(conn: &rusqlite::Connection, path: &str) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM docs WHERE path = ?", [path])
-        .map(|_| ())
-}
-
-/// Escaneo plano de ~/Notes (ignora subdirs, como Fase 2-3).
-fn scan_notes() -> Vec<(String, i64)> {
-    std::fs::read_dir(notes_dir())
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false))
-        .map(|p| {
-            let mt = file_mtime_secs(&p);
-            (p.to_string_lossy().to_string(), mt)
-        })
-        .collect()
-}
-
-/// Arranque: si la DB no existe se crea; si hay incongruencia con el disco
-/// (faltan/sobran docs o cambió un mtime), rebuild completo por escaneo.
-fn sync_from_disk(conn: &rusqlite::Connection) {
-    use std::collections::HashMap;
-    let files = scan_notes();
-    let db_rows: Option<HashMap<String, i64>> = conn
-        .prepare("SELECT path, updated_at FROM docs")
-        .ok()
-        .and_then(|mut q| {
-            q.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .ok()
-            .map(|it| it.filter_map(|r| r.ok()).collect())
-        });
-    let same = db_rows.as_ref().is_some_and(|db| {
-        files.len() == db.len() && files.iter().all(|(p, m)| db.get(p) == Some(m))
-    });
-    if same {
-        return;
-    }
-    if conn.execute("DELETE FROM docs", []).is_err() {
-        return; // DB rota: la palette sigue con títulos; el próximo arranque reintenta
-    }
-    let mut n = 0;
-    for (p, m) in &files {
-        let txt = std::fs::read_to_string(p).unwrap_or_default();
-        if upsert_doc(conn, p, &derive_title(&txt), &txt, *m).is_ok() {
-            n += 1;
-        }
-    }
-    eprintln!("[emax-notes] índice FTS rebuild: {n} docs");
-}
-
-fn open_index() -> Option<rusqlite::Connection> {
-    let db = cache_index_path();
-    if let Some(parent) = db.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return None;
-        }
-    }
-    let conn = rusqlite::Connection::open(&db).ok()?;
-    init_db(&conn).ok()?;
-    sync_from_disk(&conn);
-    Some(conn)
-}
-
-/// `docker redis puerto` → `"docker"* AND "redis"* AND "puerto"*`
-/// (cada término con sufijo `*`, `"` escapada como `""`).
-/// Vacía → None (no toca FTS: recents). `>` no llega acá (cmd_query).
-fn build_match(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
-        .collect();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" AND "))
-    }
-}
-
-struct ContentHit {
-    path: PathBuf,
-    title_hl: String,
-    snippet: String,
-}
-
-fn search_content(
-    conn: &rusqlite::Connection,
-    m: &str,
-    favs_json: &str,
-    now: i64,
-) -> rusqlite::Result<Vec<ContentHit>> {
-    let mut stmt = conn.prepare(
-        "SELECT d.path,
-                highlight(notes_fts, 0, '<b>', '</b>'),
-                snippet(notes_fts, 1, '<b>', '</b>', '…', 30)
-         FROM notes_fts JOIN docs d ON d.id = notes_fts.rowid
-         WHERE notes_fts MATCH :q
-         ORDER BY bm25(notes_fts, 10.0, 5.0)
-                  - ((:now - d.updated_at) / 86400.0) * 0.05
-                  - CASE WHEN d.path IN (SELECT value FROM json_each(:favs))
-                         THEN 2.0 ELSE 0.0 END
-         LIMIT 8",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::named_params! { ":q": m, ":now": now, ":favs": favs_json },
-        |row| {
-            let p: String = row.get(0)?;
-            Ok(ContentHit {
-                path: PathBuf::from(p),
-                title_hl: row.get(1)?,
-                snippet: row.get(2)?,
-            })
-        },
-    )?;
-    rows.collect()
-}
-
-fn favs_json() -> String {
-    let mut out = String::from("[");
-    for (i, p) in load_state().favorites.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('"');
-        out.push_str(
-            &p.to_string_lossy()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\""),
-        );
-        out.push('"');
-    }
-    out.push(']');
-    out
-}
-
-fn search_hits(s: &Shared, m: &str) -> Vec<ContentHit> {
-    let idx = s.index.borrow();
-    let Some(conn) = idx.as_ref() else {
-        return vec![];
-    };
-    search_content(conn, m, &favs_json(), now_secs()).unwrap_or_else(|e| {
-        eprintln!("[emax-notes] fts error: {e}");
-        vec![]
-    })
-}
-
-/// Upsert tras persist OK en save_now.
-fn index_upsert_path(s: &Shared, path: &PathBuf, text: &str) {
-    let mut idx = s.index.borrow_mut();
-    let Some(conn) = idx.as_mut() else { return };
-    let key = path.to_string_lossy().to_string();
-    if let Err(e) = upsert_doc(conn, &key, &derive_title(text), text, file_mtime_secs(path)) {
-        eprintln!("[emax-notes] index upsert error: {e}");
-    }
-}
-
-/// Upsert/delete incremental por evento del watcher (solo ese doc).
-fn index_paths(s: &Shared, paths: &[PathBuf]) {
-    let dir = notes_dir();
-    let mut idx = s.index.borrow_mut();
-    let Some(conn) = idx.as_mut() else { return };
-    for p in paths {
-        if p.parent() != Some(dir.as_path()) {
-            continue;
-        }
-        if p.extension().map(|x| x != "md").unwrap_or(true) {
-            continue;
-        }
-        let key = p.to_string_lossy().to_string();
-        if index_fresh(conn, p) {
-            continue;
-        }
-        match std::fs::read_to_string(p) {
-            Ok(txt) => {
-                let mt = file_mtime_secs(p);
-                if let Err(e) = upsert_doc(conn, &key, &derive_title(&txt), &txt, mt) {
-                    eprintln!("[emax-notes] index upsert error: {e}");
-                }
-            }
-            Err(_) => {
-                if let Err(e) = delete_doc(conn, &key) {
-                    eprintln!("[emax-notes] index delete error: {e}");
-                }
-            }
-        }
-    }
 }
 
 /// Snippet FTS (marcas `<b>`) → markup Pango seguro: escapa el texto
@@ -786,297 +268,67 @@ fn fts_markup(s: &str) -> String {
         .replace('\u{2}', "</b>")
 }
 
-// ---------- filtro puro de la palette (Fase 3, sin FTS) ----------
-
-fn recent_rank(idx: &Option<usize>) -> usize {
-    idx.unwrap_or(usize::MAX)
-}
-
-/// Substring case-insensitive sobre títulos (sin contenido: eso es Fase 4).
-/// Orden: prefix-match > substring; en cada grupo, más reciente primero;
-/// desempate por título. Vacía → recents primero. Con `>` → vacío
-/// (a nivel palette eso deja solo comandos).
-fn filter_notes(
-    query: &str,
-    notes: &[(PathBuf, String, Option<usize>)],
-) -> Vec<(PathBuf, String, Option<usize>)> {
-    let q = query.trim().to_lowercase();
-    if q.starts_with('>') {
+fn search_hits(s: &Shared, query: &str) -> Vec<ContentHit> {
+    let index = s.index.borrow();
+    let Some(connection) = index.as_ref() else {
         return vec![];
-    }
-    if q.is_empty() {
-        let mut v = notes.to_vec();
-        v.sort_by(|a, b| {
-            recent_rank(&a.2)
-                .cmp(&recent_rank(&b.2))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        return v;
-    }
-    let mut hit: Vec<(u8, usize, &(PathBuf, String, Option<usize>))> = notes
-        .iter()
-        .filter_map(|n| {
-            let t = n.1.to_lowercase();
-            if t.starts_with(&q) {
-                Some((0, recent_rank(&n.2), n))
-            } else if t.contains(&q) {
-                Some((1, recent_rank(&n.2), n))
-            } else {
-                None
-            }
-        })
-        .collect();
-    hit.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2 .1.cmp(&b.2 .1))
-    });
-    hit.into_iter().map(|(_, _, n)| n.clone()).collect()
-}
-
-// ---------- comandos (lista cerrada Fase 3) ----------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Cmd {
-    NewNote,
-    ToggleFavorite,
-    ShowFavorites,
-    ShowRecent,
-    DeleteCurrent,
-}
-
-impl Cmd {
-    const ALL: [Cmd; 5] = [
-        Cmd::NewNote,
-        Cmd::ToggleFavorite,
-        Cmd::ShowFavorites,
-        Cmd::ShowRecent,
-        Cmd::DeleteCurrent,
-    ];
-    fn name(self) -> &'static str {
-        match self {
-            Cmd::NewNote => "New note",
-            Cmd::ToggleFavorite => "Toggle favorite",
-            Cmd::ShowFavorites => "Show favorites",
-            Cmd::ShowRecent => "Show recent",
-            Cmd::DeleteCurrent => "Delete current note",
-        }
-    }
-    fn keywords(self) -> &'static str {
-        match self {
-            Cmd::NewNote => "new create",
-            Cmd::ToggleFavorite => "fav favorite star",
-            Cmd::ShowFavorites => "fav favorites list",
-            Cmd::ShowRecent => "recent history",
-            Cmd::DeleteCurrent => "delete remove trash",
-        }
-    }
-    fn matches(self, q: &str) -> bool {
-        q.is_empty() || self.name().to_lowercase().contains(q) || self.keywords().contains(q)
-    }
-}
-
-/// `>foo` → comandos con `foo`; sin `>` → None (notas + comandos).
-fn cmd_query(text: &str) -> Option<String> {
-    text.strip_prefix('>')
-        .map(|rest| rest.trim().to_lowercase())
-}
-
-// ---------- Fase 5: fns puras (checkbox, links, preview spans) ----------
-
-/// `- [ ]` ↔ `- [x]` preservando indentación. Vale `-`, `*`, `+`;
-/// `X` mayúscula cuenta como tildado. No-checklist → None.
-fn toggle_checkbox_line(line: &str) -> Option<String> {
-    let indent_len = line.len() - line.trim_start().len();
-    let (indent, rest) = line.split_at(indent_len);
-    let r = rest.as_bytes();
-    if r.len() < 5
-        || !(r[0] == b'-' || r[0] == b'*' || r[0] == b'+')
-        || r[1] != b' '
-        || r[2] != b'['
-        || r[4] != b']'
-    {
-        return None;
-    }
-    let toggled = match r[3] {
-        b' ' => 'x',
-        b'x' | b'X' => ' ',
-        _ => return None,
     };
-    let mut out = String::with_capacity(line.len());
-    out.push_str(indent);
-    out.push(r[0] as char);
-    out.push_str(" [");
-    out.push(toggled);
-    out.push(']');
-    out.push_str(&rest[5..]); // seguro: los 5 primeros bytes son ASCII
-    Some(out)
+    search_content(connection, query, &favs_json(), now_secs()).unwrap_or_else(|error| {
+        eprintln!("[emax-notes] fts error: {error}");
+        vec![]
+    })
 }
 
-/// Solo http(s)/mailto; resto se ignora. Corta en whitespace (`"title"`).
-fn valid_link_url(url: &str) -> Option<String> {
-    let u = url.split_whitespace().next().unwrap_or("");
-    if u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:") {
-        Some(u.to_string())
-    } else {
-        None
-    }
-}
-
-/// URL si `col` (chars) cae dentro de un `[texto](url)` de la línea.
-fn link_url_at(line: &str, col: usize) -> Option<String> {
-    let cs: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < cs.len() {
-        if cs[i] != '[' {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let Some(rel_close) = cs[i..].iter().position(|&c| c == ']') else {
-            i += 1;
-            continue;
-        };
-        let close = i + rel_close;
-        if cs.get(close + 1) != Some(&'(') {
-            i += 1;
-            continue;
-        }
-        let url_start = close + 2;
-        let Some(rel_end) = cs[url_start..].iter().position(|&c| c == ')') else {
-            i += 1;
-            continue;
-        };
-        let end = url_start + rel_end; // char idx de ')'
-        if col >= start && col <= end {
-            let url: String = cs[url_start..end].iter().collect();
-            return valid_link_url(&url);
-        }
-        i = end + 1;
-    }
-    None
-}
-
-// ---------- preview: pulldown-cmark → spans (puro, testeable) ----------
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SpanKind {
-    Text,
-    Heading(u8),
-    Bold,
-    Italic,
-    Strike,
-    Code,
-    Link,
-}
-
-#[derive(Clone, Debug)]
-struct Span {
-    text: String,
-    tags: Vec<SpanKind>,
-}
-
-/// Markdown → spans con tags. Sin WebView: el caller los vuelca a un
-/// TextBuffer read-only con TextTags (headings/bold/italic/listas
-/// tasklists/code/links). No hace panic con input arbitrario.
-fn preview_spans(md: &str) -> Vec<Span> {
-    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    let mut spans: Vec<Span> = vec![];
-    let mut stack: Vec<SpanKind> = vec![];
-    let mut lists: Vec<Option<u64>> = vec![]; // None = bullets; Some(n) = ordered counter
-    let mut item_prefix_pending = false;
-
-    let mut push = |text: &str, tags: &[SpanKind], extra: Option<SpanKind>| {
-        if text.is_empty() {
-            return;
-        }
-        let mut t = tags.to_vec();
-        if let Some(k) = extra {
-            t.push(k);
-        }
-        if t.is_empty() {
-            t.push(SpanKind::Text);
-        }
-        spans.push(Span {
-            text: text.to_string(),
-            tags: t,
-        });
+/// Upserts a document after its atomic save succeeds.
+fn index_upsert_path(s: &Shared, path: &std::path::Path, text: &str) {
+    let mut index = s.index.borrow_mut();
+    let Some(connection) = index.as_mut() else {
+        return;
     };
-    for ev in Parser::new_ext(md, opts) {
-        match ev {
-            Event::Start(Tag::Heading { level, .. }) => {
-                stack.push(SpanKind::Heading(level as u8));
-            }
-            Event::Start(Tag::Strong) => stack.push(SpanKind::Bold),
-            Event::Start(Tag::Emphasis) => stack.push(SpanKind::Italic),
-            Event::Start(Tag::Strikethrough) => stack.push(SpanKind::Strike),
-            Event::Start(Tag::Link { .. }) => stack.push(SpanKind::Link),
-            Event::Start(Tag::CodeBlock(_)) => stack.push(SpanKind::Code),
-            Event::Start(Tag::List(n)) => lists.push(n),
-            Event::Start(Tag::Item) => item_prefix_pending = true,
-            Event::Start(_) => {}
-            Event::End(TagEnd::Paragraph) => {
-                push("\n\n", &stack, None);
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                stack.retain(|k| !matches!(k, SpanKind::Heading(_)));
-                push("\n\n", &stack, None);
-            }
-            Event::End(TagEnd::Item) => {
-                item_prefix_pending = false;
-                push("\n", &stack, None);
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                stack.retain(|k| *k != SpanKind::Code);
-                push("\n", &stack, None);
-            }
-            Event::End(TagEnd::Link) => {
-                stack.retain(|k| *k != SpanKind::Link);
-            }
-            Event::End(TagEnd::Strong) => {
-                stack.retain(|k| *k != SpanKind::Bold);
-            }
-            Event::End(TagEnd::Emphasis) => {
-                stack.retain(|k| *k != SpanKind::Italic);
-            }
-            Event::End(TagEnd::Strikethrough) => {
-                stack.retain(|k| *k != SpanKind::Strike);
-            }
-            Event::End(_) => {}
-            Event::Text(t) => {
-                if item_prefix_pending {
-                    item_prefix_pending = false;
-                    match lists.last().copied() {
-                        Some(None) => push("• ", &stack, None),
-                        Some(Some(n)) => {
-                            let s = format!("{n}. ");
-                            lists.pop();
-                            lists.push(Some(n + 1));
-                            push(&s, &stack, None);
-                        }
-                        None => {}
-                    }
+    let key = path.to_string_lossy().to_string();
+    if let Err(error) = upsert_doc(
+        connection,
+        &key,
+        &derive_title(text),
+        text,
+        file_mtime_secs(path),
+    ) {
+        eprintln!("[emax-notes] index upsert error: {error}");
+    }
+}
+
+/// Upserts or deletes only the documents touched by a watcher event.
+fn index_paths(s: &Shared, paths: &[PathBuf]) {
+    let dir = notes_dir();
+    let mut index = s.index.borrow_mut();
+    let Some(connection) = index.as_mut() else {
+        return;
+    };
+    for path in paths {
+        if path.parent() != Some(dir.as_path())
+            || !path.extension().is_some_and(|extension| extension == "md")
+        {
+            continue;
+        }
+        let key = path.to_string_lossy().to_string();
+        if index_fresh(connection, path) {
+            continue;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let mtime = file_mtime_secs(path);
+                if let Err(error) = upsert_doc(connection, &key, &derive_title(&text), &text, mtime)
+                {
+                    eprintln!("[emax-notes] index upsert error: {error}");
                 }
-                push(&t, &stack, None);
             }
-            Event::Code(t) => {
-                push(&t, &stack, Some(SpanKind::Code));
+            Err(_) => {
+                if let Err(error) = delete_doc(connection, &key) {
+                    eprintln!("[emax-notes] index delete error: {error}");
+                }
             }
-            Event::TaskListMarker(done) => {
-                item_prefix_pending = false;
-                push(if done { "☑ " } else { "☐ " }, &stack, None);
-            }
-            Event::SoftBreak | Event::HardBreak => push("\n", &stack, None),
-            Event::Rule => push("———\n", &stack, None),
-            Event::Html(_) | Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
-            Event::InlineMath(t) | Event::DisplayMath(t) => push(&t, &stack, Some(SpanKind::Code)),
         }
     }
-    spans
 }
 
 // ---------- palette Ctrl+K (overlay temporal, sin estado permanente) ----------
@@ -1117,7 +369,7 @@ fn snapshot_notes() -> Vec<(PathBuf, String)> {
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().map(|x| x == "md").unwrap_or(false))
+        .filter(|p| is_markdown_file(p))
         .map(|p| {
             let t = std::fs::read_to_string(&p)
                 .map(|txt| derive_title(&txt))
@@ -1272,7 +524,7 @@ fn pal_header(list: &gtk4::ListBox, text: &str) {
     list.append(&row);
 }
 
-fn pal_add_note(pal: &PaletteUi, path: &PathBuf, title: &str, favorites: &[PathBuf]) {
+fn pal_add_note(pal: &PaletteUi, path: &Path, title: &str, favorites: &[PathBuf]) {
     let label = if favorites.iter().any(|f| f == path) {
         format!("{title} ★")
     } else {
@@ -1288,7 +540,7 @@ fn pal_add_note(pal: &PaletteUi, path: &PathBuf, title: &str, favorites: &[PathB
     pal.list.append(&row);
     pal.rows.borrow_mut().push(PalRow {
         row,
-        item: PalItem::Note(path.clone()),
+        item: PalItem::Note(path.to_path_buf()),
     });
 }
 
@@ -1331,7 +583,7 @@ fn pal_add_content(pal: &PaletteUi, hit: &ContentHit, favorites: &[PathBuf]) {
     });
 }
 
-fn pal_title_of(snap: &[(PathBuf, String)], path: &PathBuf) -> String {
+fn pal_title_of(snap: &[(PathBuf, String)], path: &Path) -> String {
     snap.iter()
         .find(|(p, _)| p == path)
         .map(|(_, t)| t.clone())
@@ -1353,7 +605,7 @@ fn refresh_palette(s: &Shared) {
     pal.rows.borrow_mut().clear();
 
     let rank = |p: &PathBuf| recents.iter().position(|r| r == p);
-    let with_rank: Vec<(PathBuf, String, Option<usize>)> = snap
+    let with_rank: Vec<NoteEntry> = snap
         .iter()
         .map(|(p, t)| (p.clone(), t.clone(), rank(p)))
         .collect();
@@ -1464,14 +716,16 @@ fn pal_activate(s: &Shared, idx: usize) {
     }
 }
 
-fn open_note_path(s: &Shared, path: &PathBuf) {
+fn open_note_path(s: &Shared, path: &Path) {
+    if !flush_or_cancel(s) {
+        return;
+    }
     close_palette(s);
     match std::fs::read_to_string(path) {
-        Ok(txt) => set_text_silent(s, &txt, Some(path.clone())), // touch_recent adentro
+        Ok(txt) => set_text_silent(s, &txt, Some(path.to_path_buf())), // touch_recent adentro
         Err(e) => {
             eprintln!("[emax-notes] no se pudo abrir {}: {e}", path.display());
             remove_from_state(path);
-            set_text_silent(s, "", None);
         }
     }
     s.window.present();
@@ -1481,11 +735,10 @@ fn open_note_path(s: &Shared, path: &PathBuf) {
 fn run_command(s: &Shared, cmd: Cmd) {
     match cmd {
         Cmd::NewNote => {
-            close_palette(s);
-            flush_or_cancel(s);
-            if !buffer_text(s).is_empty() {
-                save_now(s);
+            if !flush_or_cancel(s) {
+                return;
             }
+            close_palette(s);
             set_text_silent(s, "", None);
             s.window.present();
             s.view.grab_focus();
@@ -1525,7 +778,7 @@ fn run_command(s: &Shared, cmd: Cmd) {
                 .unwrap_or_else(|| p.display().to_string());
             let dlg = gtk4::AlertDialog::builder()
                 .message("Delete this note?")
-                .detail(&format!("{name} se borra del disco."))
+                .detail(format!("{name} se borra del disco."))
                 .buttons(["Delete", "Cancel"])
                 .build();
             let parent = s.palette.borrow().as_ref().map(|pal| pal.win.clone());
@@ -1535,10 +788,18 @@ fn run_command(s: &Shared, cmd: Cmd) {
                 None::<&gtk4::gio::Cancellable>,
                 move |resp: Result<i32, glib::Error>| {
                     if resp == Ok(0) {
-                        if let Err(e) = std::fs::remove_file(&p) {
-                            eprintln!("[emax-notes] delete error {}: {e}", p.display());
-                        } else {
-                            eprintln!("[emax-notes] borrada: {}", p.display());
+                        let deleted = match std::fs::remove_file(&p) {
+                            Ok(()) => {
+                                eprintln!("[emax-notes] borrada: {}", p.display());
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!("[emax-notes] delete error {}: {e}", p.display());
+                                false
+                            }
+                        };
+                        if !deleted {
+                            return;
                         }
                         remove_from_state(&p);
                         close_palette(&st);
@@ -1748,9 +1009,9 @@ fn toggle_checkbox_current(s: &Shared) {
     }
     let buf = s.view.buffer();
     let ins = buf.iter_at_mark(&buf.get_insert());
-    let mut ls = ins.clone();
+    let mut ls = ins;
     ls.set_line_offset(0);
-    let mut le = ls.clone();
+    let mut le = ls;
     le.forward_to_line_end();
     let line = buf.text(&ls, &le, false).to_string();
     if let Some(nl) = toggle_checkbox_line(&line) {
@@ -1763,7 +1024,7 @@ fn toggle_checkbox_current(s: &Shared) {
 
 // ---------- preview Ctrl+Shift+P: render sin WebView ----------
 
-fn preview_tag_for<'a>(kind: SpanKind, t: &'a PreviewTags) -> Option<&'a gtk4::TextTag> {
+fn preview_tag_for(kind: SpanKind, t: &PreviewTags) -> Option<&gtk4::TextTag> {
     match kind {
         SpanKind::Text => None,
         SpanKind::Heading(1) => t.h1.as_ref(),
@@ -1857,9 +1118,9 @@ fn link_at_point(view: &sourceview5::View, x: f64, y: f64) -> Option<String> {
     let (bx, by) = view.window_to_buffer_coords(gtk4::TextWindowType::Widget, x as i32, y as i32);
     let it = view.iter_at_location(bx, by)?;
     let buf = view.buffer();
-    let mut ls = it.clone();
+    let mut ls = it;
     ls.set_line_offset(0);
-    let mut le = ls.clone();
+    let mut le = ls;
     le.forward_to_line_end();
     let line = buf.text(&ls, &le, false).to_string();
     link_url_at(&line, it.line_offset() as usize)
@@ -1882,10 +1143,14 @@ fn show_last(s: &Shared) {
         .filter(|p| p.is_file())
         .or_else(last_note);
     match target {
-        Some(p) => {
-            let txt = std::fs::read_to_string(&p).unwrap_or_default();
-            set_text_silent(s, &txt, Some(p));
-        }
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(txt) => set_text_silent(s, &txt, Some(p)),
+            Err(e) => {
+                eprintln!("[emax-notes] no se pudo abrir {}: {e}", p.display());
+                remove_from_state(&p);
+                set_text_silent(s, "", None);
+            }
+        },
         None => set_text_silent(s, "", None),
     }
     s.window.present();
@@ -1894,8 +1159,9 @@ fn show_last(s: &Shared) {
 
 fn toggle(s: &Shared, want_last: bool) {
     if s.window.is_visible() {
-        flush_or_cancel(s);
-        s.window.set_visible(false);
+        if flush_or_cancel(s) {
+            s.window.set_visible(false);
+        }
     } else if want_last {
         show_last(s);
     } else {
@@ -2003,8 +1269,10 @@ fn build_ui(app: &gtk4::Application) -> Shared {
                     std::future::poll_fn(|cx| std::pin::Pin::new(&mut rx).poll_next(cx)).await;
                 let Some(paths) = next else { break }; // watcher caído: termina
                 if let Some(s) = weak.upgrade() {
-                    index_paths(&s, &paths); // incremental FTS solo de esos docs
+                    // El editor decide antes de actualizar el caché FTS: un cambio
+                    // externo no debe quedar oculto por la comprobación de frescura.
                     on_watch_event(&s, &paths);
+                    index_paths(&s, &paths); // incremental FTS solo de esos docs
                 } else {
                     break;
                 }
@@ -2086,14 +1354,14 @@ fn build_ui(app: &gtk4::Application) -> Shared {
                     find_close(&s); // stack: overlay > palette > hide app
                     return glib::Propagation::Stop;
                 }
-                flush_or_cancel(&s);
-                s.window.set_visible(false);
+                if flush_or_cancel(&s) {
+                    s.window.set_visible(false);
+                }
                 return glib::Propagation::Stop;
             }
             if matches!(ctrl_shortcut(keyval, mods), Some(Shortcut::NewNote)) {
-                flush_or_cancel(&s);
-                if !buffer_text(&s).is_empty() {
-                    save_now(&s);
+                if !flush_or_cancel(&s) {
+                    return glib::Propagation::Stop;
                 }
                 set_text_silent(&s, "", None);
                 s.view.grab_focus();
@@ -2111,8 +1379,9 @@ fn build_ui(app: &gtk4::Application) -> Shared {
     {
         let s = st.clone();
         st.window.connect_close_request(move |_| {
-            flush_or_cancel(&s);
-            s.window.set_visible(false);
+            if flush_or_cancel(&s) {
+                s.window.set_visible(false);
+            }
             glib::Propagation::Stop
         });
     }
@@ -2132,14 +1401,16 @@ fn main() {
     let ui: Rc<RefCell<Option<Shared>>> = Rc::new(RefCell::new(None));
     let ensure_ui: Rc<dyn Fn(&gtk4::Application) -> Shared> =
         Rc::new(move |app: &gtk4::Application| {
-            if ui.borrow().is_none() {
-                *ui.borrow_mut() = Some(build_ui(app));
-                println!(
-                    "[emax-notes] window.present en {:?} (objetivo <400ms cold)",
-                    t0.elapsed()
-                );
+            if let Some(existing) = ui.borrow().as_ref().cloned() {
+                return existing;
             }
-            ui.borrow().clone().unwrap()
+            let state = build_ui(app);
+            println!(
+                "[emax-notes] window.present en {:?} (objetivo <400ms cold)",
+                t0.elapsed()
+            );
+            *ui.borrow_mut() = Some(state.clone());
+            state
         });
 
     // Activación sin args (incl. 2ª instancia sin args): solo present().
