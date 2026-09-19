@@ -346,6 +346,15 @@ fn on_watch_event(s: &Shared, paths: &[PathBuf]) {
     if !paths.iter().any(|p| p == &path) {
         return;
     }
+    // mtime igual al índice = no hubo write; abrir el archivo genera inotify OPEN
+    // y notify-debouncer-mini lo reemite (AnyContinuous) para siempre.
+    if s.index
+        .borrow()
+        .as_ref()
+        .is_some_and(|c| index_fresh(c, &path))
+    {
+        return;
+    }
     match std::fs::read_to_string(&path) {
         Err(_) => {
             // Delete externo de la abierta: se conserva el buffer;
@@ -510,6 +519,20 @@ fn file_mtime_secs(p: &PathBuf) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn db_mtime(conn: &rusqlite::Connection, path: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT updated_at FROM docs WHERE path = ?",
+        [path],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// El índice ya refleja este archivo: no abrir (inotify OPEN retriggería el watcher).
+fn index_fresh(conn: &rusqlite::Connection, path: &PathBuf) -> bool {
+    path.is_file() && db_mtime(conn, &path.to_string_lossy()) == Some(file_mtime_secs(path))
 }
 
 fn now_secs() -> i64 {
@@ -736,6 +759,9 @@ fn index_paths(s: &Shared, paths: &[PathBuf]) {
             continue;
         }
         let key = p.to_string_lossy().to_string();
+        if index_fresh(conn, p) {
+            continue;
+        }
         match std::fs::read_to_string(p) {
             Ok(txt) => {
                 let mt = file_mtime_secs(p);
@@ -2306,7 +2332,10 @@ mod tests {
 
     // ---------- Fase 4: builder + recall FTS ----------
 
-    use super::{build_match, delete_doc, init_db, search_content, upsert_doc, ContentHit};
+    use super::{
+        build_match, delete_doc, file_mtime_secs, index_fresh, init_db, search_content, upsert_doc,
+        ContentHit,
+    };
     fn mem_index(docs: &[(&str, &str, &str)]) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -2323,6 +2352,28 @@ mod tests {
             .into_iter()
             .map(|h: ContentHit| h.path.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn index_fresh_por_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.md");
+        std::fs::write(&p, "hola").unwrap();
+        let mt = file_mtime_secs(&p);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        upsert_doc(&conn, &p.to_string_lossy(), "hola", "hola", mt).unwrap();
+        assert!(index_fresh(&conn, &p));
+        upsert_doc(
+            &conn,
+            &p.to_string_lossy(),
+            "hola",
+            "hola",
+            mt.saturating_sub(1),
+        )
+        .unwrap();
+        assert!(!index_fresh(&conn, &p));
+        assert!(!index_fresh(&conn, &dir.path().join("missing.md")));
     }
 
     #[test]
