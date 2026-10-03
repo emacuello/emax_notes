@@ -1,6 +1,8 @@
 # emax-notes
 
-Bloc de notas local para Hyprland y Wayland. Una ventana GTK4, Markdown en disco y atajos de teclado. Pensada para quedar flotante y centrada, y para vivir en segundo plano: cerrar la ventana la oculta.
+Bloc de notas local. Una ventana GTK4, Markdown en disco y atajos de teclado. Cerrar la ventana la oculta y el proceso sigue en segundo plano.
+
+Está pensado para [Omarchy](https://omarchy.org) sobre Hyprland: de ahí salen los colores, y la ventana está medida para quedar flotante y centrada. El programa en sí no depende de Omarchy ni de Hyprland. Corre en cualquier Linux con GTK 4 y GtkSourceView 5. En otro escritorio se lanzan los mismos comandos, con los atajos de ese entorno. Los colores de Omarchy se leen si existen; si no, usa un tema oscuro fijo.
 
 Las notas son archivos `.md` en `~/Notes`. El título de la ventana sale del primer encabezado; si no hay, de la primera línea.
 
@@ -10,7 +12,7 @@ Las notas son archivos `.md` en `~/Notes`. El título de la ventana sale del pri
 - Una sola instancia. La segunda llamada le habla a la que ya corre y termina.
 - Paleta para abrir notas, buscar en el contenido y lanzar comandos.
 - Búsqueda dentro de la nota abierta, vista previa renderizada y checklists.
-- Tema leído de Omarchy cuando esos archivos están presentes.
+- Colores de Omarchy cuando ese tema está instalado. En otro escritorio, tema oscuro fijo.
 - Si otro programa edita la nota abierta, se recarga. Con cambios locales sin guardar, pregunta cuál versión conservar.
 
 ## Requisitos
@@ -127,9 +129,9 @@ El índice es un caché. Al arrancar se reconstruye si no coincide con los archi
 
 Los colores salen de `~/.local/state/omarchy/current/theme/colors.toml` (`background`, `foreground`, `accent`, `selection`, `muted`). El tamaño de fuente sale de `shell.toml` (`font.base-size`, entre 8 y 32). Sin esos archivos hay un tema oscuro de respaldo. Al volver a mostrar la ventana se relee el tema si `colors.toml` cambió.
 
-## Hyprland
+## Omarchy
 
-La ventana mide 560×780. En Wayland la clase es el id de la aplicación, `dev.emax.notes`, así que la regla sigue valiendo cuando el título cambia.
+La ventana mide 560×780. En Wayland la clase es el id de la aplicación, `dev.emax.notes`, así que la regla sigue valiendo cuando el título cambia. En otro compositor alcanza con lanzar `emax-notes toggle-new` y `emax-notes toggle-last` desde sus atajos; flotar y centrar la ventana es opcional.
 
 En Omarchy, para pisar el atajo que ya ocupa `Super+N`:
 
