@@ -2,3 +2,6 @@
 /packaging/src/
 /packaging/pkg/
 /packaging/*.pkg.tar.zst
+.commandcode/
+# Local Pi runtime state
+.atl/

@@ -322,11 +322,12 @@ fn index_paths(s: &Shared, paths: &[PathBuf]) {
                     eprintln!("[emax-notes] index upsert error: {error}");
                 }
             }
-            Err(_) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Err(error) = delete_doc(connection, &key) {
                     eprintln!("[emax-notes] index delete error: {error}");
                 }
             }
+            Err(error) => eprintln!("[emax-notes] index read error {path:?}: {error}"),
         }
     }
 }
@@ -800,6 +801,15 @@ fn run_command(s: &Shared, cmd: Cmd) {
                         };
                         if !deleted {
                             return;
+                        }
+                        {
+                            let mut index = st.index.borrow_mut();
+                            if let Some(connection) = index.as_mut() {
+                                let key = p.to_string_lossy();
+                                if let Err(error) = delete_doc(connection, &key) {
+                                    eprintln!("[emax-notes] index delete error: {error}");
+                                }
+                            }
                         }
                         remove_from_state(&p);
                         close_palette(&st);
